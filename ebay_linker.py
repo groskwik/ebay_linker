@@ -150,21 +150,106 @@ def list_pdf_basenames(pdf_dir: Path, recursive: bool = False) -> List[str]:
 
     pattern = "**/*.pdf" if recursive else "*.pdf"
     pdfs = sorted(pdf_dir.glob(pattern))
-    return [p.stem for p in pdfs if p.is_file()]
+    basenames = [p.stem for p in pdfs if p.is_file()]
+    return basenames
 
 
 # ----------------------------
-# Core logic
+# Matching / update logic
 # ----------------------------
+
+@dataclass
+class MatchResult:
+    order_number: str
+    item_id: str
+    best_score: float
+    second_score: float
+    margin: float
+    best_key: str
+    second_key: str
+    third_key: str
+    third_score: float
+    action: str
+    title: str
+    item_url: str
+    previous_url: str
+
 
 def should_auto_update(best: float, second: float, min_score: float, min_margin: float) -> bool:
     return (best >= min_score) and ((best - second) >= min_margin)
 
 
-def ensure_entry(link_db: Dict[str, dict], key: str) -> None:
-    if key not in link_db or not isinstance(link_db.get(key), dict):
-        link_db[key] = {}
+def update_links_with_margin(
+    orders: List[OrderRow],
+    pdf_keys: List[str],
+    link_db: Dict[str, dict],
+    min_score: float,
+    min_margin: float,
+    overwrite: bool,
+) -> Tuple[List[MatchResult], Dict[str, dict]]:
+    updated = dict(link_db)
+    results: List[MatchResult] = []
 
+    for o in orders:
+        top3 = top_n_matches(o.title, pdf_keys, n=3)
+
+        # pad if fewer
+        while len(top3) < 3:
+            top3.append(("", -1.0))
+
+        (k1, s1), (k2, s2), (k3, s3) = top3
+        margin = (s1 - s2) if (s2 >= 0) else s1
+
+        prev_url = ""
+        if k1 and k1 in updated and isinstance(updated[k1], dict):
+            prev_url = str(updated[k1].get("url") or "").strip()
+
+        if not k1 or s1 < 0:
+            results.append(MatchResult(
+                o.order_number, o.item_id,
+                best_score=0.0, second_score=0.0, margin=0.0,
+                best_key="", second_key="", third_key="", third_score=0.0,
+                action="NO MATCH",
+                title=o.title, item_url=o.item_url,
+                previous_url=""
+            ))
+            continue
+
+        if should_auto_update(s1, s2, min_score=min_score, min_margin=min_margin):
+            # ensure entry exists
+            if k1 not in updated or not isinstance(updated.get(k1), dict):
+                updated[k1] = {}
+
+            if prev_url and (not overwrite) and (prev_url != o.item_url):
+                action = "SKIP (url exists)"
+            else:
+                updated[k1]["url"] = o.item_url
+                action = "UPDATE" if prev_url != o.item_url else "OK (already set)"
+        else:
+            action = "NEEDS REVIEW"
+
+        results.append(MatchResult(
+            order_number=o.order_number,
+            item_id=o.item_id,
+            best_score=s1,
+            second_score=s2 if s2 >= 0 else 0.0,
+            margin=margin if margin >= 0 else 0.0,
+            best_key=k1,
+            second_key=k2 if k2 else "",
+            third_key=k3 if k3 else "",
+            third_score=s3 if s3 >= 0 else 0.0,
+            action=action,
+            title=o.title,
+            item_url=o.item_url,
+            previous_url=prev_url,
+        ))
+
+    return results, updated
+
+
+# ----------------------------
+# Reporting
+# ----------------------------
 
 def clip(s: str, n: int) -> str:
     if s is None:
@@ -172,82 +257,55 @@ def clip(s: str, n: int) -> str:
     return s if len(s) <= n else (s[: n - 1] + "…")
 
 
-def prompt_choice(order: OrderRow, top3: List[Tuple[str, float]]) -> str:
+def print_table(matches: List[MatchResult]):
+    headers = ["order", "item_id", "best", "2nd", "Δ", "best_pdf", "action", "title"]
+    rows = []
+    for m in matches:
+        rows.append([
+            m.order_number,
+            m.item_id,
+            f"{m.best_score:5.1f}",
+            f"{m.second_score:5.1f}",
+            f"{m.margin:5.1f}",
+            clip(m.best_key, 40),
+            m.action,
+            clip(m.title, 60),
+        ])
+
+    widths = [len(h) for h in headers]
+    for r in rows:
+        for i, cell in enumerate(r):
+            widths[i] = max(widths[i], len(str(cell)))
+
+    sep = " | "
+    line = "-+-".join("-" * w for w in widths)
+
+    print(sep.join(headers[i].ljust(widths[i]) for i in range(len(headers))))
+    print(line)
+    for r in rows:
+        print(sep.join(str(r[i]).ljust(widths[i]) for i in range(len(headers))))
+
+
+def print_review_details(matches: List[MatchResult], limit: int = 50):
     """
-    Returns one of: "0","1","2","3","s","q"
+    For NEEDS REVIEW rows, print the top 3 candidates in a readable block format.
     """
-    (k1, s1), (k2, s2), (k3, s3) = top3
-    print("\n--- NEEDS INPUT ---")
-    print(f"Order: {order.order_number}   Item: {order.item_id}")
-    print(f"Title: {order.title}")
-    print(f"URL:   {order.item_url}")
-    print("\nCandidates:")
-    print(f"  1) {k1}  ({s1:.1f})")
-    print(f"  2) {k2}  ({s2:.1f})")
-    print(f"  3) {k3}  ({s3:.1f})")
-    print("\nEnter choice: 1/2/3 to select, 0 = no match, s = skip, q = quit")
-    while True:
-        ans = input("> ").strip().lower()
-        if ans in {"0", "1", "2", "3", "s", "q"}:
-            return ans
-        print("Invalid input. Please enter 0,1,2,3,s, or q.")
-
-
-def process_orders(
-    orders: List[OrderRow],
-    pdf_keys: List[str],
-    link_db: Dict[str, dict],
-    min_score: float,
-    min_margin: float,
-    overwrite: bool,
-    interactive: bool,
-) -> Dict[str, dict]:
-    updated = dict(link_db)
-
-    for o in orders:
-        top3 = top_n_matches(o.title, pdf_keys, n=3)
-        while len(top3) < 3:
-            top3.append(("", -1.0))
-
-        (k1, s1), (k2, s2), (k3, s3) = top3
-        s2_eff = s2 if s2 >= 0 else 0.0
-
-        auto_ok = k1 and should_auto_update(s1, s2_eff, min_score=min_score, min_margin=min_margin)
-
-        # Determine which key we will use, if any
-        chosen_key = ""
-        chosen_score = 0.0
-
-        if auto_ok:
-            chosen_key, chosen_score = k1, s1
-        elif interactive:
-            choice = prompt_choice(o, top3)
-            if choice == "q":
-                print("Quitting early (progress will be saved).")
-                break
-            if choice == "s" or choice == "0":
-                # skip / no match
-                continue
-            idx = int(choice) - 1
-            chosen_key, chosen_score = top3[idx]
-            if not chosen_key:
-                # defensive
-                continue
-        else:
-            # non-interactive: skip ambiguous ones
+    count = 0
+    for m in matches:
+        if m.action != "NEEDS REVIEW":
             continue
-
-        # Apply update for chosen_key
-        ensure_entry(updated, chosen_key)
-        prev_url = str(updated[chosen_key].get("url") or "").strip()
-
-        if prev_url and (not overwrite) and (prev_url != o.item_url):
-            # keep existing
-            continue
-
-        updated[chosen_key]["url"] = o.item_url
-
-    return updated
+        count += 1
+        if count > limit:
+            print(f"\n(Review list truncated at {limit} items.)")
+            break
+        print("\n--- NEEDS REVIEW ---")
+        print(f"Order: {m.order_number}  Item: {m.item_id}")
+        print(f"Title: {m.title}")
+        print(f"URL:   {m.item_url}")
+        print("Top candidates:")
+        print(f"  1) {m.best_key}  ({m.best_score:.1f})")
+        print(f"  2) {m.second_key}  ({m.second_score:.1f})")
+        print(f"  3) {m.third_key}  ({m.third_score:.1f})")
 
 
 # ----------------------------
@@ -256,7 +314,7 @@ def process_orders(
 
 def main():
     ap = argparse.ArgumentParser(
-        description="Match awaiting-shipment titles to local PDFs and update link JSON (interactive selection for unknowns)."
+        description="Match awaiting-shipment titles to local PDFs and update link JSON (auto-update with margin rule)."
     )
     ap.add_argument("--orders-csv", required=True, help="CSV from awaiting shipment scraper (awaiting_shipment_items.csv).")
     ap.add_argument("--pdf-dir", default=r"c:\Users\benoi\Downloads\ebay_manuals", help="Folder containing PDFs.")
@@ -266,7 +324,7 @@ def main():
     ap.add_argument("--min-score", type=float, default=60.0, help="Auto-update minimum best score (default: 60).")
     ap.add_argument("--min-margin", type=float, default=8.0, help="Auto-update minimum (best-second) margin (default: 8).")
     ap.add_argument("--overwrite", action="store_true", help="Overwrite existing urls in links JSON.")
-    ap.add_argument("--non-interactive", action="store_true", help="Do not prompt; skip ambiguous matches.")
+    ap.add_argument("--show-review", action="store_true", help="Print expanded details for NEEDS REVIEW rows.")
     args = ap.parse_args()
 
     orders_csv = Path(args.orders_csv).resolve()
@@ -283,18 +341,35 @@ def main():
     if not isinstance(link_db, dict):
         raise SystemExit(f"links-json must be a JSON object: {links_json}")
 
-    updated = process_orders(
+    matches, updated = update_links_with_margin(
         orders=orders,
         pdf_keys=pdf_keys,
         link_db=link_db,
         min_score=float(args.min_score),
         min_margin=float(args.min_margin),
         overwrite=bool(args.overwrite),
-        interactive=(not args.non_interactive),
     )
+
+    print_table(matches)
+
+    upd = sum(1 for m in matches if m.action.startswith("UPDATE"))
+    ok = sum(1 for m in matches if m.action.startswith("OK"))
+    skip = sum(1 for m in matches if m.action.startswith("SKIP"))
+    review = sum(1 for m in matches if m.action == "NEEDS REVIEW")
+
+    print("\nSummary")
+    print(f"  PDFs scanned:  {len(pdf_keys)}")
+    print(f"  UPDATE:       {upd}")
+    print(f"  OK:           {ok}")
+    print(f"  SKIP:         {skip}")
+    print(f"  NEEDS REVIEW: {review}")
+    print(f"  Rule: auto-update if best>= {args.min_score:.1f} and (best-2nd)>= {args.min_margin:.1f}")
 
     save_json(out_links, updated)
     print(f"\nWrote links JSON: {out_links}")
+
+    if args.show_review and review:
+        print_review_details(matches)
 
 
 if __name__ == "__main__":
