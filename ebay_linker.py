@@ -1,311 +1,247 @@
-#!/usr/bin/env python
+#!/usr/bin/env python3
+# -*- coding: utf-8 -*-
+
 from __future__ import annotations
 
 import argparse
 import csv
 import json
+import os
 import re
+import sys
+import subprocess
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Dict, List, Tuple
+from typing import Dict, List, Optional, Tuple
 
 
 # ----------------------------
-# Normalization / matching
+# Text normalization & scoring
 # ----------------------------
 
-STOPWORDS = {
-    "manual", "operation", "operating", "owners", "owner's", "owner",
-    "instruction", "instructions", "user", "users", "user's", "guide",
-    "reference", "quick", "start", "basic", "service", "maintenance",
-    "schematics", "with", "and", "&", "for", "the", "a", "an", "series",
-    "digital", "camera", "transceiver", "sewing", "machine",
-    "mark", "mk", "mkii", "ii", "iii", "iv", "v", "vi", "vii", "viii",
-    "cd", "dvd", "blu", "ray", "black",
+_STOPWORDS = {
+    "manual", "instruction", "instructions", "owner", "owners", "user", "users", "guide",
+    "operation", "service", "schematics", "reference", "advanced", "basic",
+    "pages", "page", "with", "and", "&", "for", "the", "a", "an", "of",
+    "mk", "mkii", "mkiii", "mark", "series",
 }
 
-ROMAN_MAP = {
-    "i": "1", "ii": "2", "iii": "3", "iv": "4", "v": "5",
-    "vi": "6", "vii": "7", "viii": "8", "ix": "9", "x": "10",
-}
-
-RE_NON_ALNUM = re.compile(r"[^a-z0-9]+")
-RE_MULTI_SPACE = re.compile(r"\s+")
-
-
-def normalize_text(s: str) -> str:
-    s = (s or "").lower().strip()
-    s = s.replace("’", "'").replace("–", "-").replace("—", "-")
-
-    tokens = re.split(r"\s+", s)
-    tokens2 = []
-    for t in tokens:
-        t_clean = RE_NON_ALNUM.sub("", t)
-        if t_clean in ROMAN_MAP:
-            tokens2.append(ROMAN_MAP[t_clean])
-        else:
-            tokens2.append(t)
-    s = " ".join(tokens2)
-
-    s = RE_NON_ALNUM.sub(" ", s)
-    s = RE_MULTI_SPACE.sub(" ", s).strip()
+def _norm(s: str) -> str:
+    s = (s or "").lower()
+    s = s.replace("’", "'")
+    s = re.sub(r"[^\w\s\-]+", " ", s)
+    s = re.sub(r"[_]+", " ", s)
+    s = re.sub(r"\s+", " ", s).strip()
     return s
 
+def _tokens(s: str) -> List[str]:
+    s = _norm(s)
+    if not s:
+        return []
+    toks = s.split()
+    toks = [t for t in toks if t not in _STOPWORDS and len(t) >= 2]
+    return toks
 
-def token_set(s: str) -> List[str]:
-    s = normalize_text(s)
-    toks = [t for t in s.split() if t and t not in STOPWORDS]
+def _jaccard(a: List[str], b: List[str]) -> float:
+    sa, sb = set(a), set(b)
+    if not sa and not sb:
+        return 1.0
+    if not sa or not sb:
+        return 0.0
+    inter = len(sa & sb)
+    union = len(sa | sb)
+    return inter / union if union else 0.0
+
+def _ratio(a: str, b: str) -> float:
+    import difflib
+    a2, b2 = _norm(a), _norm(b)
+    if not a2 and not b2:
+        return 1.0
+    if not a2 or not b2:
+        return 0.0
+    return difflib.SequenceMatcher(None, a2, b2).ratio()
+
+def similarity_score(title: str, pdf_base: str) -> float:
+    r = _ratio(title, pdf_base)
+    j = _jaccard(_tokens(title), _tokens(pdf_base))
+    return 100.0 * (0.55 * r + 0.45 * j)
+
+
+# ----------------------------
+# PDF inventory
+# ----------------------------
+
+@dataclass
+class PdfEntry:
+    base: str   # filename stem
+    path: Path  # full path
+
+def list_pdfs(folder: Path, recursive: bool) -> List[PdfEntry]:
+    if not folder.exists():
+        raise FileNotFoundError(f"PDF folder not found: {folder}")
+
+    paths = list(folder.rglob("*.pdf")) if recursive else list(folder.glob("*.pdf"))
+
+    # Deduplicate by normalized base name, keep first seen
     seen = set()
-    out = []
-    for t in toks:
-        if t not in seen:
-            seen.add(t)
-            out.append(t)
+    out: List[PdfEntry] = []
+    for p in paths:
+        base = p.stem
+        key = _norm(base)
+        if key in seen:
+            continue
+        seen.add(key)
+        out.append(PdfEntry(base=base, path=p))
+
     return out
 
 
-def jaccard(a: List[str], b: List[str]) -> float:
-    sa, sb = set(a), set(b)
-    if not sa or not sb:
-        return 0.0
-    return len(sa & sb) / len(sa | sb)
-
-
-def containment(a: List[str], b: List[str]) -> float:
-    sa, sb = set(a), set(b)
-    if not sa or not sb:
-        return 0.0
-    small, big = (sa, sb) if len(sa) <= len(sb) else (sb, sa)
-    return len(small & big) / len(small) if small else 0.0
-
-
-def score_match(title: str, key: str) -> float:
-    t_tokens = token_set(title)
-    k_tokens = token_set(key)
-
-    j = jaccard(t_tokens, k_tokens)
-    c = containment(t_tokens, k_tokens)
-
-    nt = normalize_text(title)
-    nk = normalize_text(key)
-
-    substr_bonus = 0.0
-    if nk and nk in nt:
-        substr_bonus = 0.10
-    elif nt and nt in nk:
-        substr_bonus = 0.07
-
-    raw = 0.55 * j + 0.35 * c + substr_bonus
-    raw = max(0.0, min(1.0, raw))
-    return 100.0 * raw
-
-
-def top_n_matches(title: str, candidates: List[str], n: int = 3) -> List[Tuple[str, float]]:
-    scored = [(k, score_match(title, k)) for k in candidates]
-    scored.sort(key=lambda x: x[1], reverse=True)
-    return scored[:n]
-
-
 # ----------------------------
-# I/O structures
+# Links JSON
 # ----------------------------
 
-@dataclass
-class OrderRow:
-    order_number: str
-    item_id: str
-    title: str
-    item_url: str
-
-
-def read_orders_csv(path: Path) -> List[OrderRow]:
-    rows: List[OrderRow] = []
-    with path.open("r", newline="", encoding="utf-8") as f:
-        r = csv.DictReader(f)
-        for d in r:
-            rows.append(OrderRow(
-                order_number=(d.get("order_number") or "").strip(),
-                item_id=(d.get("item_id") or "").strip(),
-                title=(d.get("title") or "").strip(),
-                item_url=(d.get("item_url") or "").strip(),
-            ))
-    return rows
-
-
-def load_json(path: Path) -> dict:
+def load_links_json(path: Path) -> Dict[str, Dict[str, str]]:
     if not path.exists():
         return {}
     with path.open("r", encoding="utf-8") as f:
-        return json.load(f)
+        data = json.load(f)
+    if not isinstance(data, dict):
+        raise ValueError("links json must be an object/dict")
+    out: Dict[str, Dict[str, str]] = {}
+    for k, v in data.items():
+        if isinstance(v, dict):
+            out[k] = v
+        else:
+            out[k] = {"url": str(v)}
+    return out
 
-
-def save_json(path: Path, data: dict) -> None:
+def save_links_json(path: Path, data: Dict[str, Dict[str, str]]) -> None:
     with path.open("w", encoding="utf-8") as f:
         json.dump(data, f, indent=2, ensure_ascii=False)
-
-
-def list_pdf_basenames(pdf_dir: Path, recursive: bool = False) -> List[str]:
-    if not pdf_dir.exists():
-        raise SystemExit(f"PDF directory not found: {pdf_dir}")
-
-    pattern = "**/*.pdf" if recursive else "*.pdf"
-    pdfs = sorted(pdf_dir.glob(pattern))
-    basenames = [p.stem for p in pdfs if p.is_file()]
-    return basenames
+    print(f"\nSaved links JSON: {path}")
 
 
 # ----------------------------
-# Matching / update logic
+# Orders CSV
+# ----------------------------
+
+def read_orders_csv(path: Path) -> List[Dict[str, str]]:
+    if not path.exists():
+        raise FileNotFoundError(f"orders csv not found: {path}")
+    with path.open("r", encoding="utf-8", newline="") as f:
+        r = csv.DictReader(f)
+        rows = []
+        for row in r:
+            row.setdefault("item_id", "")
+            row.setdefault("title", "")
+            row.setdefault("item_url", "")
+            rows.append(row)
+    return rows
+
+
+# ----------------------------
+# Matching helpers
 # ----------------------------
 
 @dataclass
-class MatchResult:
-    order_number: str
-    item_id: str
-    best_score: float
-    second_score: float
-    margin: float
-    best_key: str
-    second_key: str
-    third_key: str
-    third_score: float
-    action: str
-    title: str
-    item_url: str
-    previous_url: str
+class Candidate:
+    pdf: PdfEntry
+    score: float
 
+def top_candidates(title: str, pdfs: List[PdfEntry], k: int = 3) -> List[Candidate]:
+    scored = [Candidate(p, similarity_score(title, p.base)) for p in pdfs]
+    scored.sort(key=lambda c: c.score, reverse=True)
+    return scored[:k]
 
-def should_auto_update(best: float, second: float, min_score: float, min_margin: float) -> bool:
-    return (best >= min_score) and ((best - second) >= min_margin)
-
-
-def update_links_with_margin(
-    orders: List[OrderRow],
-    pdf_keys: List[str],
-    link_db: Dict[str, dict],
+def choose_match_interactive(
+    order_title: str,
+    cands: List[Candidate],
     min_score: float,
     min_margin: float,
-    overwrite: bool,
-) -> Tuple[List[MatchResult], Dict[str, dict]]:
-    updated = dict(link_db)
-    results: List[MatchResult] = []
+) -> Optional[PdfEntry]:
+    if not cands:
+        print("\nNo candidates found.")
+        return None
 
-    for o in orders:
-        top3 = top_n_matches(o.title, pdf_keys, n=3)
+    best = cands[0]
+    second = cands[1] if len(cands) > 1 else None
+    margin = best.score - (second.score if second else 0.0)
+    auto_ok = (best.score >= min_score) and ((second is None) or (margin >= min_margin))
 
-        # pad if fewer
-        while len(top3) < 3:
-            top3.append(("", -1.0))
+    print("\nOrder title:")
+    print(f"  {order_title}")
 
-        (k1, s1), (k2, s2), (k3, s3) = top3
-        margin = (s1 - s2) if (s2 >= 0) else s1
+    print("\nTop matches:")
+    for i, c in enumerate(cands, start=1):
+        print(f"  {i}. {c.pdf.base}   ({c.score:.1f}%)")
 
-        prev_url = ""
-        if k1 and k1 in updated and isinstance(updated[k1], dict):
-            prev_url = str(updated[k1].get("url") or "").strip()
+    if auto_ok:
+        print(f"\nAuto-selected: {best.pdf.base}  (score={best.score:.1f}%, margin={margin:.1f})")
+        return best.pdf
 
-        if not k1 or s1 < 0:
-            results.append(MatchResult(
-                o.order_number, o.item_id,
-                best_score=0.0, second_score=0.0, margin=0.0,
-                best_key="", second_key="", third_key="", third_score=0.0,
-                action="NO MATCH",
-                title=o.title, item_url=o.item_url,
-                previous_url=""
-            ))
+    while True:
+        s = input("\nSelect match: 1/2/3, or 0 for no match: ").strip()
+        if s == "0":
+            return None
+        if s in ("1", "2", "3"):
+            idx = int(s) - 1
+            if idx < len(cands):
+                return cands[idx].pdf
+            print("That option is not available.")
             continue
-
-        if should_auto_update(s1, s2, min_score=min_score, min_margin=min_margin):
-            # ensure entry exists
-            if k1 not in updated or not isinstance(updated.get(k1), dict):
-                updated[k1] = {}
-
-            if prev_url and (not overwrite) and (prev_url != o.item_url):
-                action = "SKIP (url exists)"
-            else:
-                updated[k1]["url"] = o.item_url
-                action = "UPDATE" if prev_url != o.item_url else "OK (already set)"
-        else:
-            action = "NEEDS REVIEW"
-
-        results.append(MatchResult(
-            order_number=o.order_number,
-            item_id=o.item_id,
-            best_score=s1,
-            second_score=s2 if s2 >= 0 else 0.0,
-            margin=margin if margin >= 0 else 0.0,
-            best_key=k1,
-            second_key=k2 if k2 else "",
-            third_key=k3 if k3 else "",
-            third_score=s3 if s3 >= 0 else 0.0,
-            action=action,
-            title=o.title,
-            item_url=o.item_url,
-            previous_url=prev_url,
-        ))
-
-    return results, updated
+        print("Invalid input. Use 1/2/3 or 0.")
 
 
 # ----------------------------
-# Reporting
+# myprint automation (NO changes to myprint.py)
 # ----------------------------
 
-def clip(s: str, n: int) -> str:
-    if s is None:
-        return ""
-    return s if len(s) <= n else (s[: n - 1] + "…")
-
-
-def print_table(matches: List[MatchResult]):
-    headers = ["order", "item_id", "best", "2nd", "Δ", "best_pdf", "action", "title"]
-    rows = []
-    for m in matches:
-        rows.append([
-            m.order_number,
-            m.item_id,
-            f"{m.best_score:5.1f}",
-            f"{m.second_score:5.1f}",
-            f"{m.margin:5.1f}",
-            clip(m.best_key, 40),
-            m.action,
-            clip(m.title, 60),
-        ])
-
-    widths = [len(h) for h in headers]
-    for r in rows:
-        for i, cell in enumerate(r):
-            widths[i] = max(widths[i], len(str(cell)))
-
-    sep = " | "
-    line = "-+-".join("-" * w for w in widths)
-
-    print(sep.join(headers[i].ljust(widths[i]) for i in range(len(headers))))
-    print(line)
-    for r in rows:
-        print(sep.join(str(r[i]).ljust(widths[i]) for i in range(len(headers))))
-
-
-def print_review_details(matches: List[MatchResult], limit: int = 50):
+def find_pdf_matches_like_myprint(pdfs: List[PdfEntry], partial_name: str) -> List[PdfEntry]:
     """
-    For NEEDS REVIEW rows, print the top 3 candidates in a readable block format.
+    Emulates your myprint.find_pdf() matching behavior:
+    - case-insensitive substring match against filename (including .pdf in myprint, but we use base)
     """
-    count = 0
-    for m in matches:
-        if m.action != "NEEDS REVIEW":
-            continue
-        count += 1
-        if count > limit:
-            print(f"\n(Review list truncated at {limit} items.)")
-            break
-        print("\n--- NEEDS REVIEW ---")
-        print(f"Order: {m.order_number}  Item: {m.item_id}")
-        print(f"Title: {m.title}")
-        print(f"URL:   {m.item_url}")
-        print("Top candidates:")
-        print(f"  1) {m.best_key}  ({m.best_score:.1f})")
-        print(f"  2) {m.second_key}  ({m.second_score:.1f})")
-        print(f"  3) {m.third_key}  ({m.third_score:.1f})")
+    q = (partial_name or "").strip().lower()
+    if not q:
+        return []
+    matches = [p for p in pdfs if q in p.path.name.lower() and p.path.suffix.lower() == ".pdf"]
+    return matches
+
+def pick_index_for_exact_basename(matches: List[PdfEntry], chosen_basename: str) -> Optional[int]:
+    """
+    If myprint would show a numbered list, we can preselect the correct entry by index.
+    We match by exact filename (basename + .pdf) if possible.
+    Returns 1-based index or None.
+    """
+    target_pdf = (chosen_basename or "").strip()
+    if not target_pdf:
+        return None
+    target_filename = target_pdf + ".pdf"
+    for i, p in enumerate(matches, start=1):
+        if p.path.name == target_filename:
+            return i
+    return None
+
+def run_myprint_with_auto_inputs(
+    myprint_path: str,
+    python_exe: Optional[str],
+    auto_inputs: List[str],
+) -> int:
+    """
+    Run myprint.py and feed ALL prompts via stdin.
+    This mirrors your GUI approach (auto_inputs list).
+    """
+    py = python_exe or sys.executable
+    cmd = [py, myprint_path]
+
+    # Ensure trailing newline so last input is consumed
+    payload = "\n".join(auto_inputs) + "\n"
+
+    print("\n=== Running myprint.py with auto inputs ===")
+    print("Command:", " ".join(f'"{c}"' if " " in c else c for c in cmd))
+    # Don't capture stdout/stderr: let user see myprint output in console
+    completed = subprocess.run(cmd, input=payload, text=True)
+    return completed.returncode
 
 
 # ----------------------------
@@ -313,63 +249,130 @@ def print_review_details(matches: List[MatchResult], limit: int = 50):
 # ----------------------------
 
 def main():
-    ap = argparse.ArgumentParser(
-        description="Match awaiting-shipment titles to local PDFs and update link JSON (auto-update with margin rule)."
-    )
-    ap.add_argument("--orders-csv", required=True, help="CSV from awaiting shipment scraper (awaiting_shipment_items.csv).")
-    ap.add_argument("--pdf-dir", default=r"c:\Users\benoi\Downloads\ebay_manuals", help="Folder containing PDFs.")
-    ap.add_argument("--recursive", action="store_true", help="Scan pdf-dir recursively.")
-    ap.add_argument("--links-json", required=True, help="Link DB JSON (pdf base name -> {url}).")
-    ap.add_argument("--out-links-json", default="", help="Output path (default overwrites links-json).")
-    ap.add_argument("--min-score", type=float, default=60.0, help="Auto-update minimum best score (default: 60).")
-    ap.add_argument("--min-margin", type=float, default=8.0, help="Auto-update minimum (best-second) margin (default: 8).")
-    ap.add_argument("--overwrite", action="store_true", help="Overwrite existing urls in links JSON.")
-    ap.add_argument("--show-review", action="store_true", help="Print expanded details for NEEDS REVIEW rows.")
+    ap = argparse.ArgumentParser()
+    ap.add_argument("--orders-csv", required=True, type=Path)
+    ap.add_argument("--links-json", required=True, type=Path)
+    ap.add_argument("--out-links-json", required=True, type=Path)
+
+    ap.add_argument("--pdf-folder", type=Path, default=Path(r"c:\Users\benoi\Downloads\ebay_manuals"),
+                    help="Folder containing PDFs (default: c:\\Users\\benoi\\Downloads\\ebay_manuals)")
+    ap.add_argument("--recursive", action="store_true", help="Scan PDFs recursively under --pdf-folder")
+
+    ap.add_argument("--min-score", type=float, default=60.0)
+    ap.add_argument("--min-margin", type=float, default=8.0)
+
+    ap.add_argument("--print", dest="do_print", action="store_true",
+                    help="After selecting a PDF, run myprint.py using auto-inputs (no changes to myprint.py).")
+    ap.add_argument("--myprint", default="myprint.py",
+                    help="Path to myprint.py (default: myprint.py in current directory).")
+    ap.add_argument("--python", default=None,
+                    help="Python executable to run myprint.py (default: current interpreter).")
+
+    ap.add_argument("--printer", type=str, default="",
+                    help="Optional default printer selection (e.g. 1 or 2). If omitted, you will be prompted once.")
+    ap.add_argument("--always-ask-printer", action="store_true",
+                    help="Ask printer number for every print (default: ask once per run).")
+
+    ap.add_argument("--max-orders", type=int, default=0,
+                    help="Optional limit for debugging (0 = no limit).")
+
     args = ap.parse_args()
 
-    orders_csv = Path(args.orders_csv).resolve()
-    pdf_dir = Path(args.pdf_dir).resolve()
-    links_json = Path(args.links_json).resolve()
-    out_links = Path(args.out_links_json).resolve() if args.out_links_json else links_json
+    orders = read_orders_csv(args.orders_csv)
+    links = load_links_json(args.links_json)
 
-    orders = read_orders_csv(orders_csv)
-    pdf_keys = list_pdf_basenames(pdf_dir, recursive=args.recursive)
-    if not pdf_keys:
-        raise SystemExit(f"No PDFs found in: {pdf_dir}")
+    pdfs = list_pdfs(args.pdf_folder, args.recursive)
+    if not pdfs:
+        print(f"No PDFs found in: {args.pdf_folder} (recursive={args.recursive})")
+        sys.exit(2)
 
-    link_db = load_json(links_json)
-    if not isinstance(link_db, dict):
-        raise SystemExit(f"links-json must be a JSON object: {links_json}")
+    print(f"Loaded {len(orders)} orders from: {args.orders_csv}")
+    print(f"Loaded {len(links)} existing link entries from: {args.links_json}")
+    print(f"Indexed {len(pdfs)} unique PDF base names from: {args.pdf_folder} (recursive={args.recursive})")
 
-    matches, updated = update_links_with_margin(
-        orders=orders,
-        pdf_keys=pdf_keys,
-        link_db=link_db,
-        min_score=float(args.min_score),
-        min_margin=float(args.min_margin),
-        overwrite=bool(args.overwrite),
-    )
+    default_printer = (args.printer or "").strip()
 
-    print_table(matches)
+    # If printing is enabled and no printer provided, prompt once (same as your GUI concept)
+    if args.do_print and not default_printer and not args.always_ask_printer:
+        default_printer = input("\nDefault printer number for this run (e.g. 1 or 2): ").strip()
 
-    upd = sum(1 for m in matches if m.action.startswith("UPDATE"))
-    ok = sum(1 for m in matches if m.action.startswith("OK"))
-    skip = sum(1 for m in matches if m.action.startswith("SKIP"))
-    review = sum(1 for m in matches if m.action == "NEEDS REVIEW")
+    updated = 0
+    processed = 0
 
-    print("\nSummary")
-    print(f"  PDFs scanned:  {len(pdf_keys)}")
-    print(f"  UPDATE:       {upd}")
-    print(f"  OK:           {ok}")
-    print(f"  SKIP:         {skip}")
-    print(f"  NEEDS REVIEW: {review}")
-    print(f"  Rule: auto-update if best>= {args.min_score:.1f} and (best-2nd)>= {args.min_margin:.1f}")
+    for row in orders:
+        processed += 1
+        if args.max_orders and processed > args.max_orders:
+            break
 
-    save_json(out_links, updated)
-    print(f"\nWrote links JSON: {out_links}")
+        title = (row.get("title") or "").strip()
+        url = (row.get("item_url") or "").strip()
+        item_id = (row.get("item_id") or "").strip()
 
-    if args.show_review and review:
-        print_review_details(matches)
+        if not title or not url:
+            continue
+
+        cands = top_candidates(title, pdfs, k=3)
+        chosen_pdf = choose_match_interactive(title, cands, args.min_score, args.min_margin)
+        if not chosen_pdf:
+            print("No match selected. Moving on.")
+            continue
+
+        # Update links JSON: key = PDF base name
+        links.setdefault(chosen_pdf.base, {})
+        links[chosen_pdf.base]["url"] = url
+        updated += 1
+        print(f"Linked: {chosen_pdf.base}  ->  {url}   (item_id={item_id})")
+
+        # Printing workflow
+        if args.do_print:
+            act = input("Print now? [P]rint / [S]kip / [Q]uit printing: ").strip().lower()
+            if act == "":
+                act = "p"
+            if act.startswith("q"):
+                print("Printing disabled for the remainder of this run.")
+                args.do_print = False
+                continue
+            if act.startswith("s"):
+                print("Skipped printing; moving to next order.")
+                continue
+
+            # Printer number
+            prn = default_printer
+            if args.always_ask_printer or not prn:
+                prn = input("Printer number (e.g. 1 or 2): ").strip()
+
+            # Page range (blank allowed)
+            page_range = input("Page range for myprint (blank = default): ").strip()
+
+            # We will feed myprint:
+            # 1) printer number
+            # 2) "Enter part of PDF filename" -> chosen_pdf.base
+            # 3) if myprint reports multiple matches -> choose correct index automatically
+            # 4) "Enter the page range..." -> page_range (can be blank)
+
+            auto_inputs: List[str] = []
+            auto_inputs.append(prn)
+            auto_inputs.append(chosen_pdf.base)
+
+            # Determine if myprint.find_pdf() would return multiple matches for this hint
+            matches = find_pdf_matches_like_myprint(pdfs, chosen_pdf.base)
+            if len(matches) > 1:
+                idx = pick_index_for_exact_basename(matches, chosen_pdf.base)
+                if idx is None:
+                    # Fallback: choose first match (should be rare if basename is truly exact)
+                    idx = 1
+                    print("WARNING: multiple PDF matches; exact filename not found. Selecting #1 by default.")
+                auto_inputs.append(str(idx))
+
+            # page range prompt
+            auto_inputs.append(page_range)
+
+            rc = run_myprint_with_auto_inputs(args.myprint, args.python, auto_inputs)
+            if rc != 0:
+                print(f"WARNING: myprint.py returned exit code {rc}. Continuing.")
+
+    save_links_json(args.out_links_json, links)
+    print(f"\nDone. Updated/added {updated} links. Processed {processed} order rows.")
 
 
 if __name__ == "__main__":
