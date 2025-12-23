@@ -12,7 +12,8 @@ import sys
 import subprocess
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Dict, List, Optional, Tuple
+from typing import Dict, List, Optional
+from urllib.parse import urlparse
 
 
 # ----------------------------
@@ -68,6 +69,21 @@ def similarity_score(title: str, pdf_base: str) -> float:
 
 
 # ----------------------------
+# URL -> item_id helper
+# ----------------------------
+
+RE_ITM = re.compile(r"/itm/(\d+)")
+
+def extract_item_id_from_url(url: str) -> str:
+    try:
+        path = urlparse(url).path
+    except Exception:
+        path = url or ""
+    m = RE_ITM.search(path)
+    return m.group(1) if m else ""
+
+
+# ----------------------------
 # PDF inventory
 # ----------------------------
 
@@ -97,7 +113,7 @@ def list_pdfs(folder: Path, recursive: bool) -> List[PdfEntry]:
 
 
 # ----------------------------
-# Links JSON
+# Links JSON (pdf_base -> {url, item_id, ...})
 # ----------------------------
 
 def load_links_json(path: Path) -> Dict[str, Dict[str, str]]:
@@ -107,10 +123,11 @@ def load_links_json(path: Path) -> Dict[str, Dict[str, str]]:
         data = json.load(f)
     if not isinstance(data, dict):
         raise ValueError("links json must be an object/dict")
+
     out: Dict[str, Dict[str, str]] = {}
     for k, v in data.items():
         if isinstance(v, dict):
-            out[k] = v
+            out[k] = {str(kk): str(vv) for kk, vv in v.items()}
         else:
             out[k] = {"url": str(v)}
     return out
@@ -119,6 +136,22 @@ def save_links_json(path: Path, data: Dict[str, Dict[str, str]]) -> None:
     with path.open("w", encoding="utf-8") as f:
         json.dump(data, f, indent=2, ensure_ascii=False)
     print(f"\nSaved links JSON: {path}")
+
+def build_itemid_index(links: Dict[str, Dict[str, str]]) -> Dict[str, str]:
+    """
+    Build map: item_id -> pdf_base_name
+    Uses explicit 'item_id' field if present, else extracts from 'url' if possible.
+    """
+    idx: Dict[str, str] = {}
+    for pdf_base, rec in links.items():
+        if not isinstance(rec, dict):
+            continue
+        item_id = (rec.get("item_id") or "").strip()
+        if not item_id:
+            item_id = extract_item_id_from_url(rec.get("url", ""))
+        if item_id:
+            idx[item_id] = pdf_base
+    return idx
 
 
 # ----------------------------
@@ -199,7 +232,7 @@ def choose_match_interactive(
 def find_pdf_matches_like_myprint(pdfs: List[PdfEntry], partial_name: str) -> List[PdfEntry]:
     """
     Emulates your myprint.find_pdf() matching behavior:
-    - case-insensitive substring match against filename (including .pdf in myprint, but we use base)
+    - case-insensitive substring match against filename
     """
     q = (partial_name or "").strip().lower()
     if not q:
@@ -229,17 +262,16 @@ def run_myprint_with_auto_inputs(
 ) -> int:
     """
     Run myprint.py and feed ALL prompts via stdin.
-    This mirrors your GUI approach (auto_inputs list).
+    Mirrors your GUI approach: auto_inputs list.
     """
     py = python_exe or sys.executable
     cmd = [py, myprint_path]
 
-    # Ensure trailing newline so last input is consumed
     payload = "\n".join(auto_inputs) + "\n"
 
     print("\n=== Running myprint.py with auto inputs ===")
     print("Command:", " ".join(f'"{c}"' if " " in c else c for c in cmd))
-    # Don't capture stdout/stderr: let user see myprint output in console
+
     completed = subprocess.run(cmd, input=payload, text=True)
     return completed.returncode
 
@@ -280,19 +312,21 @@ def main():
 
     orders = read_orders_csv(args.orders_csv)
     links = load_links_json(args.links_json)
+    itemid_index = build_itemid_index(links)
 
     pdfs = list_pdfs(args.pdf_folder, args.recursive)
     if not pdfs:
         print(f"No PDFs found in: {args.pdf_folder} (recursive={args.recursive})")
         sys.exit(2)
 
+    # Quick lookup for pdf base -> PdfEntry
+    pdf_by_normbase: Dict[str, PdfEntry] = {_norm(p.base): p for p in pdfs}
+
     print(f"Loaded {len(orders)} orders from: {args.orders_csv}")
     print(f"Loaded {len(links)} existing link entries from: {args.links_json}")
     print(f"Indexed {len(pdfs)} unique PDF base names from: {args.pdf_folder} (recursive={args.recursive})")
 
     default_printer = (args.printer or "").strip()
-
-    # If printing is enabled and no printer provided, prompt once (same as your GUI concept)
     if args.do_print and not default_printer and not args.always_ask_printer:
         default_printer = input("\nDefault printer number for this run (e.g. 1 or 2): ").strip()
 
@@ -311,15 +345,39 @@ def main():
         if not title or not url:
             continue
 
-        cands = top_candidates(title, pdfs, k=3)
-        chosen_pdf = choose_match_interactive(title, cands, args.min_score, args.min_margin)
-        if not chosen_pdf:
-            print("No match selected. Moving on.")
-            continue
+        chosen_pdf: Optional[PdfEntry] = None
+
+        # --- NEW FEATURE: short-circuit if item_id already known in links JSON ---
+        if item_id and item_id in itemid_index:
+            known_pdf_base = itemid_index[item_id]
+            chosen_pdf = pdf_by_normbase.get(_norm(known_pdf_base))
+
+            print("\nOrder title:")
+            print(f"  {title}")
+            if chosen_pdf:
+                print(f"\nKnown item_id {item_id} already linked to PDF: {chosen_pdf.base} (skipping fuzzy match)")
+            else:
+                print(
+                    f"\nKnown item_id {item_id} is linked to '{known_pdf_base}' in links JSON, "
+                    f"but that PDF was not found in the scanned folder. Falling back to fuzzy match."
+                )
+                chosen_pdf = None
+
+        # Fallback: normal fuzzy matching
+        if chosen_pdf is None:
+            cands = top_candidates(title, pdfs, k=3)
+            chosen_pdf = choose_match_interactive(title, cands, args.min_score, args.min_margin)
+            if not chosen_pdf:
+                print("No match selected. Moving on.")
+                continue
 
         # Update links JSON: key = PDF base name
         links.setdefault(chosen_pdf.base, {})
         links[chosen_pdf.base]["url"] = url
+        if item_id:
+            links[chosen_pdf.base]["item_id"] = item_id
+            itemid_index[item_id] = chosen_pdf.base  # keep in-run index fresh
+
         updated += 1
         print(f"Linked: {chosen_pdf.base}  ->  {url}   (item_id={item_id})")
 
@@ -336,35 +394,24 @@ def main():
                 print("Skipped printing; moving to next order.")
                 continue
 
-            # Printer number
             prn = default_printer
             if args.always_ask_printer or not prn:
                 prn = input("Printer number (e.g. 1 or 2): ").strip()
 
-            # Page range (blank allowed)
             page_range = input("Page range for myprint (blank = default): ").strip()
-
-            # We will feed myprint:
-            # 1) printer number
-            # 2) "Enter part of PDF filename" -> chosen_pdf.base
-            # 3) if myprint reports multiple matches -> choose correct index automatically
-            # 4) "Enter the page range..." -> page_range (can be blank)
 
             auto_inputs: List[str] = []
             auto_inputs.append(prn)
             auto_inputs.append(chosen_pdf.base)
 
-            # Determine if myprint.find_pdf() would return multiple matches for this hint
             matches = find_pdf_matches_like_myprint(pdfs, chosen_pdf.base)
             if len(matches) > 1:
                 idx = pick_index_for_exact_basename(matches, chosen_pdf.base)
                 if idx is None:
-                    # Fallback: choose first match (should be rare if basename is truly exact)
                     idx = 1
                     print("WARNING: multiple PDF matches; exact filename not found. Selecting #1 by default.")
                 auto_inputs.append(str(idx))
 
-            # page range prompt
             auto_inputs.append(page_range)
 
             rc = run_myprint_with_auto_inputs(args.myprint, args.python, auto_inputs)
