@@ -1,6 +1,5 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
-
 from __future__ import annotations
 
 import argparse
@@ -8,8 +7,8 @@ import csv
 import json
 import os
 import re
-import sys
 import subprocess
+import sys
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Dict, List, Optional
@@ -17,19 +16,20 @@ from urllib.parse import urlparse
 
 
 # ----------------------------
-# Text normalization & scoring
+# Normalization / similarity
 # ----------------------------
 
 _STOPWORDS = {
-    "manual", "instruction", "instructions", "owner", "owners", "user", "users", "guide",
-    "operation", "service", "schematics", "reference", "advanced", "basic",
-    "pages", "page", "with", "and", "&", "for", "the", "a", "an", "of",
-    "mk", "mkii", "mkiii", "mark", "series",
+    "the", "a", "an", "and", "or", "for", "to", "of", "in", "on", "with",
+    "manual", "user", "users", "guide", "instruction", "instructions",
+    "reference", "owner", "owners", "operating", "operation",
 }
 
 def _norm(s: str) -> str:
-    s = (s or "").lower()
-    s = s.replace("’", "'")
+    s = (s or "").strip().lower()
+    if not s:
+        return ""
+    # keep alnum, whitespace, hyphen; convert punctuation to spaces
     s = re.sub(r"[^\w\s\-]+", " ", s)
     s = re.sub(r"[_]+", " ", s)
     s = re.sub(r"\s+", " ", s).strip()
@@ -62,9 +62,9 @@ def _ratio(a: str, b: str) -> float:
         return 0.0
     return difflib.SequenceMatcher(None, a2, b2).ratio()
 
-def similarity_score(title: str, pdf_base: str) -> float:
-    r = _ratio(title, pdf_base)
-    j = _jaccard(_tokens(title), _tokens(pdf_base))
+def similarity_score(title: str, other: str) -> float:
+    r = _ratio(title, other)
+    j = _jaccard(_tokens(title), _tokens(other))
     return 100.0 * (0.55 * r + 0.45 * j)
 
 
@@ -108,7 +108,6 @@ def list_pdfs(folder: Path, recursive: bool) -> List[PdfEntry]:
             continue
         seen.add(key)
         out.append(PdfEntry(base=base, path=p))
-
     return out
 
 
@@ -173,7 +172,192 @@ def read_orders_csv(path: Path) -> List[Dict[str, str]]:
 
 
 # ----------------------------
-# Matching helpers
+# Printed manual inventory CSV
+# ----------------------------
+
+@dataclass
+class ManualEntry:
+    title: str
+    box: Optional[str]
+    cover: bool
+
+def load_manuals_from_csv_any(path: Path) -> Dict[str, ManualEntry]:
+    """
+    Supports BOTH:
+      A) Header CSV: title,box,cover
+      B) No-header CSV rows: <title>,<box>,<cover>
+    Returns dict keyed by the exact title (as in file).
+    """
+    out: Dict[str, ManualEntry] = {}
+    if not path or not path.exists():
+        return out
+
+    # Read first non-empty line to detect header
+    first_line = ""
+    with path.open("r", encoding="utf-8", newline="") as f:
+        for line in f:
+            if line.strip():
+                first_line = line.strip()
+                break
+
+    if not first_line:
+        return out
+
+    # naive header detection
+    lower = first_line.lower()
+    has_header = ("title" in lower and "box" in lower and "cover" in lower)
+
+    if has_header:
+        with path.open("r", encoding="utf-8", newline="") as f:
+            reader = csv.DictReader(f)
+            for row in reader:
+                title = (row.get("title") or "").strip()
+                if not title:
+                    continue
+                box_raw = (row.get("box") or "").strip()
+                box = box_raw or None
+                cover_raw = (row.get("cover") or "").strip().lower()
+                cover = cover_raw in ("1", "true", "yes", "y", "on")
+                out[title] = ManualEntry(title=title, box=box, cover=cover)
+        return out
+
+    # no-header: parse as rows of 3 columns
+    with path.open("r", encoding="utf-8", newline="") as f:
+        reader = csv.reader(f)
+        for row in reader:
+            if not row:
+                continue
+            # allow extra commas in title by joining all-but-last-2 if needed
+            # typical is exactly 3 columns: title, box, cover
+            if len(row) < 1:
+                continue
+            if len(row) == 1:
+                title = row[0].strip()
+                box = None
+                cover = False
+            elif len(row) == 2:
+                title = row[0].strip()
+                box = row[1].strip() or None
+                cover = False
+            else:
+                # last two are box + cover; everything before is title
+                title = ",".join(row[:-2]).strip()
+                box = row[-2].strip() or None
+                cover_raw = (row[-1] or "").strip().lower()
+                cover = cover_raw in ("1", "true", "yes", "y", "on")
+
+            if not title:
+                continue
+            out[title] = ManualEntry(title=title, box=box, cover=cover)
+
+    return out
+
+def build_manual_title_index(manuals: Dict[str, ManualEntry]) -> List[ManualEntry]:
+    # list form is enough; we score all titles and pick best
+    return list(manuals.values())
+
+def find_best_manual_match(
+    order_title: str,
+    manuals_list: List[ManualEntry],
+    k: int = 3,
+) -> List[tuple[ManualEntry, float]]:
+    scored: List[tuple[ManualEntry, float]] = []
+    for m in manuals_list:
+        scored.append((m, similarity_score(order_title, m.title)))
+    scored.sort(key=lambda t: t[1], reverse=True)
+    return scored[:k]
+
+def manual_match_auto_pick(
+    scored_top: List[tuple[ManualEntry, float]],
+    min_score: float,
+    min_margin: float,
+) -> Optional[tuple[ManualEntry, float, float]]:
+    """
+    Returns (best_entry, best_score, margin) if auto-confident, else None.
+    """
+    if not scored_top:
+        return None
+    best, best_score = scored_top[0]
+    second_score = scored_top[1][1] if len(scored_top) > 1 else 0.0
+    margin = best_score - second_score
+    if best_score >= min_score and (len(scored_top) == 1 or margin >= min_margin):
+        return (best, best_score, margin)
+    return None
+
+def print_manual_inventory_status(
+    order_title: str,
+    manuals_list: List[ManualEntry],
+    min_score: float,
+    min_margin: float,
+    interactive: bool,
+) -> None:
+    if not manuals_list:
+        print("\nPrinted-manual inventory: (no database loaded)")
+        return
+
+    top = find_best_manual_match(order_title, manuals_list, k=3)
+    auto = manual_match_auto_pick(top, min_score, min_margin)
+
+    print("\nPrinted-manual inventory check:")
+    if auto is not None:
+        best, best_score, margin = auto
+        box_txt = best.box if best.box else "NOT PRINTED (no box)"
+        cover_txt = "YES" if best.cover else "NO"
+        print(f"  FOUND: {best.title}")
+        print(f"  Score: {best_score:.1f}% (margin {margin:.1f})")
+        print(f"  Box:   {box_txt}")
+        print(f"  Cover book: {cover_txt}")
+        return
+
+    # Not confident
+    if not top:
+        print("  NOT FOUND (no candidates)")
+        return
+
+    # If the best score is very low, treat as not found but still show candidates
+    best_score = top[0][1]
+    if best_score < min_score and not interactive:
+        print(f"  NOT FOUND (best score {best_score:.1f}% < {min_score:.1f}%)")
+        print("  Top candidates (for reference):")
+        for i, (m, sc) in enumerate(top, start=1):
+            box_txt = m.box if m.box else "NOT PRINTED"
+            cover_txt = "YES" if m.cover else "NO"
+            print(f"    {i}. {m.title}  ({sc:.1f}%)  [{box_txt}, cover:{cover_txt}]")
+        return
+
+    # Otherwise, show candidates; optionally allow a manual selection
+    print("  Ambiguous match. Top candidates:")
+    for i, (m, sc) in enumerate(top, start=1):
+        box_txt = m.box if m.box else "NOT PRINTED"
+        cover_txt = "YES" if m.cover else "NO"
+        print(f"    {i}. {m.title}  ({sc:.1f}%)  [{box_txt}, cover:{cover_txt}]")
+
+    if not interactive:
+        print("  (interactive selection disabled; continuing)")
+        return
+
+    while True:
+        s = input("  Select inventory match: 1/2/3, or 0 for 'not in inventory': ").strip()
+        if s == "0":
+            print("  Marked as NOT FOUND in printed inventory.")
+            return
+        if s in ("1", "2", "3"):
+            idx = int(s) - 1
+            if idx < len(top):
+                m, sc = top[idx]
+                box_txt = m.box if m.box else "NOT PRINTED (no box)"
+                cover_txt = "YES" if m.cover else "NO"
+                print(f"  SELECTED: {m.title} ({sc:.1f}%)")
+                print(f"  Box:   {box_txt}")
+                print(f"  Cover book: {cover_txt}")
+                return
+            print("  That option is not available.")
+            continue
+        print("  Invalid input. Use 1/2/3 or 0.")
+
+
+# ----------------------------
+# Matching helpers (orders -> PDFs)
 # ----------------------------
 
 @dataclass
@@ -282,6 +466,7 @@ def run_myprint_with_auto_inputs(
 
 def main():
     ap = argparse.ArgumentParser()
+
     ap.add_argument("--orders-csv", required=True, type=Path)
     ap.add_argument("--links-json", required=True, type=Path)
     ap.add_argument("--out-links-json", required=True, type=Path)
@@ -292,6 +477,16 @@ def main():
 
     ap.add_argument("--min-score", type=float, default=60.0)
     ap.add_argument("--min-margin", type=float, default=8.0)
+
+    # NEW: printed manual inventory database
+    ap.add_argument("--manuals-csv", type=Path, default=Path("manuals.csv"),
+                    help="Printed-manual inventory CSV (default: manuals.csv in current directory)")
+    ap.add_argument("--manuals-min-score", type=float, default=70.0,
+                    help="Min score to auto-detect printed inventory match (default: 70.0)")
+    ap.add_argument("--manuals-min-margin", type=float, default=8.0,
+                    help="Min margin to auto-detect printed inventory match (default: 8.0)")
+    ap.add_argument("--manuals-interactive", action="store_true",
+                    help="If inventory match is ambiguous, allow interactive 0/1/2/3 selection")
 
     ap.add_argument("--print", dest="do_print", action="store_true",
                     help="After selecting a PDF, run myprint.py using auto-inputs (no changes to myprint.py).")
@@ -319,12 +514,20 @@ def main():
         print(f"No PDFs found in: {args.pdf_folder} (recursive={args.recursive})")
         sys.exit(2)
 
+    # Printed manual inventory load
+    manuals_map = load_manuals_from_csv_any(args.manuals_csv)
+    manuals_list = build_manual_title_index(manuals_map)
+
     # Quick lookup for pdf base -> PdfEntry
     pdf_by_normbase: Dict[str, PdfEntry] = {_norm(p.base): p for p in pdfs}
 
     print(f"Loaded {len(orders)} orders from: {args.orders_csv}")
     print(f"Loaded {len(links)} existing link entries from: {args.links_json}")
     print(f"Indexed {len(pdfs)} unique PDF base names from: {args.pdf_folder} (recursive={args.recursive})")
+    if args.manuals_csv and args.manuals_csv.exists():
+        print(f"Loaded {len(manuals_list)} printed-manual inventory entries from: {args.manuals_csv}")
+    else:
+        print(f"Printed-manual inventory CSV not found (or not provided): {args.manuals_csv}")
 
     default_printer = (args.printer or "").strip()
     if args.do_print and not default_printer and not args.always_ask_printer:
@@ -347,7 +550,7 @@ def main():
 
         chosen_pdf: Optional[PdfEntry] = None
 
-        # --- NEW FEATURE: short-circuit if item_id already known in links JSON ---
+        # --- eBay database short-circuit if item_id already known in links JSON ---
         if item_id and item_id in itemid_index:
             known_pdf_base = itemid_index[item_id]
             chosen_pdf = pdf_by_normbase.get(_norm(known_pdf_base))
@@ -363,7 +566,29 @@ def main():
                 )
                 chosen_pdf = None
 
-        # Fallback: normal fuzzy matching
+            # --- NEW: printed-manual inventory check happens right here ---
+            print_manual_inventory_status(
+                order_title=title,
+                manuals_list=manuals_list,
+                min_score=args.manuals_min_score,
+                min_margin=args.manuals_min_margin,
+                interactive=args.manuals_interactive,
+            )
+
+        # If not short-circuited above, still do printed-inventory check before matching PDFs
+        # (so you always see whether it is already printed)
+        if chosen_pdf is None:
+            print("\nOrder title:")
+            print(f"  {title}")
+            print_manual_inventory_status(
+                order_title=title,
+                manuals_list=manuals_list,
+                min_score=args.manuals_min_score,
+                min_margin=args.manuals_min_margin,
+                interactive=args.manuals_interactive,
+            )
+
+        # Fallback: normal fuzzy matching to PDFs
         if chosen_pdf is None:
             cands = top_candidates(title, pdfs, k=3)
             chosen_pdf = choose_match_interactive(title, cands, args.min_score, args.min_margin)
