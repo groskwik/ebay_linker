@@ -1,11 +1,10 @@
-#!/usr/bin/env python3
+##!/usr/bin/env python3
 # -*- coding: utf-8 -*-
 from __future__ import annotations
 
 import argparse
 import csv
 import json
-import os
 import re
 import subprocess
 import sys
@@ -13,6 +12,7 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import Dict, List, Optional, Tuple
 from urllib.parse import urlparse
+from concurrent.futures import ThreadPoolExecutor, as_completed
 
 
 # ----------------------------
@@ -191,7 +191,7 @@ def read_orders_csv(path: Path) -> List[Dict[str, str]]:
 
 
 # ----------------------------
-# Printed manual inventory CSV (optional)
+# Printed manual inventory CSV (optional) - kept as-is
 # ----------------------------
 
 @dataclass
@@ -201,11 +201,6 @@ class ManualEntry:
     cover: bool
 
 def load_manuals_from_csv_any(path: Path) -> Dict[str, ManualEntry]:
-    """
-    Supports BOTH:
-      A) Header CSV: title,box,cover
-      B) No-header CSV rows: <title>,<box>,<cover>
-    """
     out: Dict[str, ManualEntry] = {}
     if not path or not path.exists():
         return out
@@ -259,13 +254,6 @@ def load_manuals_from_csv_any(path: Path) -> Dict[str, ManualEntry]:
                 continue
             out[title] = ManualEntry(title=title, box=box, cover=cover)
     return out
-
-def find_best_manual_match(order_title: str, manuals: List[ManualEntry], k: int = 3) -> List[Tuple[ManualEntry, float]]:
-    scored: List[Tuple[ManualEntry, float]] = []
-    for m in manuals:
-        scored.append((m, similarity_score(order_title, m.title)))
-    scored.sort(key=lambda t: t[1], reverse=True)
-    return scored[:k]
 
 
 # ----------------------------
@@ -342,11 +330,7 @@ def pick_index_for_exact_basename(matches: List[PdfEntry], chosen_basename: str)
             return i
     return None
 
-def run_myprint_with_auto_inputs(
-    myprint_path: str,
-    python_exe: Optional[str],
-    auto_inputs: List[str],
-) -> int:
+def run_myprint_with_auto_inputs(myprint_path: str, python_exe: Optional[str], auto_inputs: List[str]) -> int:
     py = python_exe or sys.executable
     cmd = [py, myprint_path]
     payload = "\n".join(auto_inputs) + "\n"
@@ -367,11 +351,6 @@ def myprint_auto_print_range(
     myprint_path: str,
     python_exe: Optional[str],
 ) -> int:
-    """
-    Print chosen_pdf with myprint.py without any user intervention.
-    We supply: printer, pdf_basename, optional index (if myprint would list multiple matches),
-    then page_range.
-    """
     auto_inputs: List[str] = []
     auto_inputs.append(printer)
     auto_inputs.append(chosen_pdf.base)
@@ -389,15 +368,16 @@ def myprint_auto_print_range(
 
 
 # ----------------------------
-# print360 mode
+# print360 mode (unchanged, kept for compatibility)
 # ----------------------------
 
 @dataclass
 class Print360Resume:
-    order_index: int          # index in orders list
+    order_index: int
     pdf: PdfEntry
     total_pages: int
-    next_page: int            # next page to print (1-based)
+    next_page: int
+
 def run_print360_batch(
     *,
     orders: List[Dict[str, str]],
@@ -410,20 +390,6 @@ def run_print360_batch(
     python_exe: Optional[str],
     page_limit: int = 360,
 ) -> Tuple[int, int, Optional[Print360Resume]]:
-    """
-    Prints up to `page_limit` pages total, with ZERO prompts (except printer already chosen).
-
-    IMPORTANT duplex constraint:
-      - If the batch must stop mid-manual, FORCE the partial print to end on an EVEN page number.
-        This may cause the batch to print 1 extra page (e.g. 361 instead of 360) to preserve duplex parity.
-
-    Rules:
-      - If item_id is not known in links JSON index: skip automatically.
-      - If known but PDF missing/unreadable: skip automatically.
-      - Prints full manuals until limit reached; last manual may be partial (and is even-ended).
-    Returns:
-      (next_start_index, pages_printed, resume_state)
-    """
     pages_printed = 0
     idx = start_index
     resume: Optional[Print360Resume] = None
@@ -438,7 +404,6 @@ def run_print360_batch(
             idx += 1
             continue
 
-        # Only print items already known in links JSON ("eBay database")
         if not item_id or item_id not in itemid_index:
             print(f"\n[print360] SKIP (not in links DB): item_id={item_id!r}  title={title}")
             idx += 1
@@ -461,17 +426,12 @@ def run_print360_batch(
         if remaining_capacity <= 0:
             break
 
-        # Full manual fits in remaining capacity => print all pages
         if total_pages <= remaining_capacity:
             pr = f"1-{total_pages}"
             print(f"\n[print360] PRINT FULL: {pdf.base}  pages={pr}  (total={total_pages})")
             rc = myprint_auto_print_range(
-                pdfs=pdfs,
-                chosen_pdf=pdf,
-                printer=printer,
-                page_range=pr,
-                myprint_path=myprint_path,
-                python_exe=python_exe,
+                pdfs=pdfs, chosen_pdf=pdf, printer=printer, page_range=pr,
+                myprint_path=myprint_path, python_exe=python_exe,
             )
             if rc != 0:
                 print(f"[print360] WARNING: myprint exit code {rc} (continuing)")
@@ -479,53 +439,29 @@ def run_print360_batch(
             idx += 1
             continue
 
-        # Partial print needed to fill capacity
         start_page = 1
-        end_page = start_page + remaining_capacity - 1  # the "natural" end page
-
-        # FORCE EVEN END PAGE for duplex parity (may add 1 page beyond limit)
+        end_page = start_page + remaining_capacity - 1
         if end_page % 2 == 1:
             end_page += 1
-
-        # Clamp to total pages
         if end_page > total_pages:
             end_page = total_pages
-            # If clamping made it odd, try to step down by 1 (only if still >= start_page)
-            # This prevents ending on odd when the manual itself ends odd.
             if end_page % 2 == 1 and end_page - 1 >= start_page:
                 end_page -= 1
 
         pr = f"{start_page}-{end_page}"
         printed_now = (end_page - start_page + 1) if end_page >= start_page else 0
 
-        print(
-            f"\n[print360] PRINT PARTIAL (even-ended): {pdf.base}  pages={pr}  "
-            f"(total={total_pages}, batch_target={page_limit}, printed_now={printed_now})"
-        )
-
+        print(f"\n[print360] PRINT PARTIAL (even-ended): {pdf.base}  pages={pr}  (total={total_pages})")
         rc = myprint_auto_print_range(
-            pdfs=pdfs,
-            chosen_pdf=pdf,
-            printer=printer,
-            page_range=pr,
-            myprint_path=myprint_path,
-            python_exe=python_exe,
+            pdfs=pdfs, chosen_pdf=pdf, printer=printer, page_range=pr,
+            myprint_path=myprint_path, python_exe=python_exe,
         )
         if rc != 0:
             print(f"[print360] WARNING: myprint exit code {rc} (continuing)")
 
         pages_printed += printed_now
-
-        # Save resume state if we did not finish the manual
         if end_page < total_pages:
-            resume = Print360Resume(
-                order_index=idx,
-                pdf=pdf,
-                total_pages=total_pages,
-                next_page=end_page + 1,
-            )
-
-        # Batch is considered "full enough" now; stop
+            resume = Print360Resume(order_index=idx, pdf=pdf, total_pages=total_pages, next_page=end_page + 1)
         break
 
     next_start_index = idx
@@ -539,23 +475,275 @@ def finish_resume_manual(
     myprint_path: str,
     python_exe: Optional[str],
 ) -> None:
-    """
-    Finish printing remaining pages of the partially printed manual.
-    """
     if resume.next_page > resume.total_pages:
         return
     pr = f"{resume.next_page}-{resume.total_pages}"
     print(f"\n[resume] FINISH MANUAL: {resume.pdf.base}  pages={pr}  (total={resume.total_pages})")
     rc = myprint_auto_print_range(
-        pdfs=pdfs,
-        chosen_pdf=resume.pdf,
-        printer=printer,
-        page_range=pr,
-        myprint_path=myprint_path,
-        python_exe=python_exe,
+        pdfs=pdfs, chosen_pdf=resume.pdf, printer=printer, page_range=pr,
+        myprint_path=myprint_path, python_exe=python_exe,
     )
     if rc != 0:
         print(f"[resume] WARNING: myprint exit code {rc} (continuing)")
+
+
+# ----------------------------
+# print720 mode (NEW)
+# ----------------------------
+
+@dataclass
+class EligibleDoc:
+    order_index: int     # index in the original orders list
+    pdf: PdfEntry
+    total_pages: int
+
+@dataclass
+class PrintTask:
+    pdf: PdfEntry
+    start_page: int
+    end_page: int
+
+    @property
+    def page_range(self) -> str:
+        return f"{self.start_page}-{self.end_page}"
+
+    @property
+    def pages(self) -> int:
+        return max(0, self.end_page - self.start_page + 1)
+
+@dataclass
+class PrintStreamPos:
+    doc_list_index: int  # index into eligible_docs list
+    next_page: int       # next page within that doc (1-based)
+
+@dataclass
+class Print720Plan:
+    tasks_p1: List[PrintTask]
+    tasks_p2: List[PrintTask]
+    printed_p1: int
+    printed_p2: int
+    end_pos: PrintStreamPos
+    has_more: bool
+
+def _build_eligible_docs(
+    *,
+    orders: List[Dict[str, str]],
+    itemid_index: Dict[str, str],
+    pdf_by_normbase: Dict[str, PdfEntry],
+) -> List[EligibleDoc]:
+    out: List[EligibleDoc] = []
+    for i, row in enumerate(orders):
+        title = (row.get("title") or "").strip()
+        url = (row.get("item_url") or "").strip()
+        item_id = (row.get("item_id") or "").strip()
+
+        if not title or not url:
+            continue
+
+        if not item_id or item_id not in itemid_index:
+            continue
+
+        pdf_base = itemid_index[item_id]
+        pdf = pdf_by_normbase.get(_norm(pdf_base))
+        if not pdf:
+            continue
+
+        total_pages = get_pdf_pagecount(pdf.path)
+        if not total_pages or total_pages <= 0:
+            continue
+
+        out.append(EligibleDoc(order_index=i, pdf=pdf, total_pages=total_pages))
+    return out
+
+def _advance_pos(docs: List[EligibleDoc], pos: PrintStreamPos) -> PrintStreamPos:
+    # If next_page is past total, move to next doc
+    while pos.doc_list_index < len(docs):
+        d = docs[pos.doc_list_index]
+        if pos.next_page <= d.total_pages:
+            return pos
+        pos = PrintStreamPos(doc_list_index=pos.doc_list_index + 1, next_page=1)
+    return pos
+
+def _plan_for_one_printer(
+    *,
+    docs: List[EligibleDoc],
+    start_pos: PrintStreamPos,
+    page_limit: int,
+    force_even_end_if_cut: bool = True,
+) -> Tuple[List[PrintTask], int, PrintStreamPos, bool]:
+    """
+    Plans print tasks for one printer by consuming up to page_limit pages from the stream.
+    If the allocation ends mid-document, it forces end_page to an even number (may add 1 page).
+    Returns: (tasks, pages_allocated, end_pos, ended_on_cut)
+    """
+    tasks: List[PrintTask] = []
+    allocated = 0
+    pos = _advance_pos(docs, start_pos)
+    ended_on_cut = False
+
+    while pos.doc_list_index < len(docs) and allocated < page_limit:
+        d = docs[pos.doc_list_index]
+        start_page = pos.next_page
+        remaining_in_doc = d.total_pages - start_page + 1
+        remaining_capacity = page_limit - allocated
+
+        if remaining_in_doc <= remaining_capacity:
+            # Take the rest of the doc
+            end_page = d.total_pages
+            tasks.append(PrintTask(pdf=d.pdf, start_page=start_page, end_page=end_page))
+            allocated += (end_page - start_page + 1)
+            pos = PrintStreamPos(doc_list_index=pos.doc_list_index + 1, next_page=1)
+            pos = _advance_pos(docs, pos)
+            continue
+
+        # Need to cut inside the doc
+        end_page = start_page + remaining_capacity - 1
+
+        if force_even_end_if_cut and (end_page % 2 == 1):
+            end_page += 1  # may exceed limit by 1, but preserves duplex parity
+
+        if end_page > d.total_pages:
+            end_page = d.total_pages
+            # if clamped to odd total, step down to even when possible
+            if force_even_end_if_cut and (end_page % 2 == 1) and (end_page - 1 >= start_page):
+                end_page -= 1
+
+        tasks.append(PrintTask(pdf=d.pdf, start_page=start_page, end_page=end_page))
+        allocated += max(0, end_page - start_page + 1)
+        pos = PrintStreamPos(doc_list_index=pos.doc_list_index, next_page=end_page + 1)
+        pos = _advance_pos(docs, pos)
+        ended_on_cut = True
+        break
+
+    return tasks, allocated, pos, ended_on_cut
+
+def plan_print720(
+    *,
+    orders: List[Dict[str, str]],
+    itemid_index: Dict[str, str],
+    pdf_by_normbase: Dict[str, PdfEntry],
+    start_pos: PrintStreamPos,
+    limit_each: int = 360,
+) -> Print720Plan:
+    """
+    Dry-run planner:
+      - Builds eligible docs (item must be in links DB, PDF exists, page count readable)
+      - Consumes the stream:
+          first limit_each pages -> printer 1
+          next  limit_each pages -> printer 2
+      - Cuts inside a doc end on even page (duplex parity) when needed.
+    """
+    docs = _build_eligible_docs(orders=orders, itemid_index=itemid_index, pdf_by_normbase=pdf_by_normbase)
+
+    # start_pos is in the "eligible docs stream" coordinates
+    pos0 = _advance_pos(docs, start_pos)
+
+    t1, p1, pos1, _ = _plan_for_one_printer(docs=docs, start_pos=pos0, page_limit=limit_each, force_even_end_if_cut=True)
+    t2, p2, pos2, _ = _plan_for_one_printer(docs=docs, start_pos=pos1, page_limit=limit_each, force_even_end_if_cut=True)
+
+    # Do we have more after this batch?
+    pos2a = _advance_pos(docs, pos2)
+    has_more = pos2a.doc_list_index < len(docs)
+
+    return Print720Plan(
+        tasks_p1=t1,
+        tasks_p2=t2,
+        printed_p1=p1,
+        printed_p2=p2,
+        end_pos=pos2a,
+        has_more=has_more,
+    )
+
+def _print_plan_summary(plan: Print720Plan) -> None:
+    print("\n[print720] Dry run plan:")
+    print(f"  Printer 1 pages: {plan.printed_p1} (target ~360, may be 361 for duplex)")
+    for t in plan.tasks_p1:
+        print(f"    - {t.pdf.base}: {t.page_range}  ({t.pages} pages)")
+    print(f"  Printer 2 pages: {plan.printed_p2} (target ~360, may be 361 for duplex)")
+    for t in plan.tasks_p2:
+        print(f"    - {t.pdf.base}: {t.page_range}  ({t.pages} pages)")
+
+def _run_tasks_for_printer(
+    *,
+    printer: str,
+    tasks: List[PrintTask],
+    pdfs: List[PdfEntry],
+    myprint_path: str,
+    python_exe: Optional[str],
+    tag: str,
+) -> int:
+    """
+    Runs a list of tasks sequentially for one printer.
+    Returns last non-zero rc if any; else 0.
+    """
+    last_rc = 0
+    for t in tasks:
+        print(f"\n[{tag}] PRINT: {t.pdf.base}  pages={t.page_range}  on printer={printer}")
+        rc = myprint_auto_print_range(
+            pdfs=pdfs,
+            chosen_pdf=t.pdf,
+            printer=printer,
+            page_range=t.page_range,
+            myprint_path=myprint_path,
+            python_exe=python_exe,
+        )
+        if rc != 0:
+            last_rc = rc
+            print(f"[{tag}] WARNING: myprint exit code {rc} (continuing)")
+    return last_rc
+
+def execute_print720(
+    *,
+    plan: Print720Plan,
+    printer1: str,
+    printer2: str,
+    pdfs: List[PdfEntry],
+    myprint_path: str,
+    python_exe: Optional[str],
+) -> None:
+    """
+    Executes printer 1 and printer 2 queues concurrently (when both have tasks).
+    If only one queue has tasks, runs only that one.
+    """
+    has1 = len(plan.tasks_p1) > 0
+    has2 = len(plan.tasks_p2) > 0
+
+    if has1 and has2:
+        print("\n[print720] Starting BOTH printers concurrently...")
+        with ThreadPoolExecutor(max_workers=2) as ex:
+            futs = []
+            futs.append(ex.submit(
+                _run_tasks_for_printer,
+                printer=printer1, tasks=plan.tasks_p1, pdfs=pdfs,
+                myprint_path=myprint_path, python_exe=python_exe, tag="P1"
+            ))
+            futs.append(ex.submit(
+                _run_tasks_for_printer,
+                printer=printer2, tasks=plan.tasks_p2, pdfs=pdfs,
+                myprint_path=myprint_path, python_exe=python_exe, tag="P2"
+            ))
+            for f in as_completed(futs):
+                _ = f.result()
+        print("\n[print720] Both printer queues completed.")
+        return
+
+    if has1:
+        print("\n[print720] Only Printer 1 has work; running Printer 1 queue...")
+        _run_tasks_for_printer(
+            printer=printer1, tasks=plan.tasks_p1, pdfs=pdfs,
+            myprint_path=myprint_path, python_exe=python_exe, tag="P1"
+        )
+        return
+
+    if has2:
+        print("\n[print720] Only Printer 2 has work; running Printer 2 queue...")
+        _run_tasks_for_printer(
+            printer=printer2, tasks=plan.tasks_p2, pdfs=pdfs,
+            myprint_path=myprint_path, python_exe=python_exe, tag="P2"
+        )
+        return
+
+    print("\n[print720] No eligible pages to print in this batch.")
 
 
 # ----------------------------
@@ -571,19 +759,13 @@ def main():
 
     ap.add_argument("--pdf-folder", type=Path, default=Path(r"c:\Users\benoi\Downloads\ebay_manuals"),
                     help="Folder containing PDFs (default: c:\\Users\\benoi\\Downloads\\ebay_manuals)")
-    ap.add_argument(
-        "--pdf-folder2",
-        type=Path,
-        default=Path(r"c:\Users\benoi\Downloads\Manuals"),
-        help="Optional second PDF folder (default: c:\\Users\\benoi\\Downloads\\Manuals)"
-    )
-
+    ap.add_argument("--pdf-folder2", type=Path, default=Path(r"c:\Users\benoi\Downloads\Manuals"),
+                    help="Optional second PDF folder (default: c:\\Users\\benoi\\Downloads\\Manuals)")
     ap.add_argument("--recursive", action="store_true", help="Scan PDFs recursively under --pdf-folder")
 
     ap.add_argument("--min-score", type=float, default=60.0)
     ap.add_argument("--min-margin", type=float, default=8.0)
 
-    # Optional printed-manual inventory (kept from previous version; not required for print360)
     ap.add_argument("--manuals-csv", type=Path, default=Path("manuals.csv"),
                     help="Printed-manual inventory CSV (default: manuals.csv in current directory)")
 
@@ -594,37 +776,39 @@ def main():
     ap.add_argument("--python", default=None,
                     help="Python executable to run myprint.py (default: current interpreter).")
 
-    ap.add_argument("--printer", type=str, default="",
-                    help="Default printer selection (e.g. 1 or 2).")
+    ap.add_argument("--printer", type=str, default="", help="Default printer selection (e.g. 1 or 2).")
+    ap.add_argument("--printer2", type=str, default="", help="Second printer selection (print720 mode).")
     ap.add_argument("--always-ask-printer", action="store_true",
                     help="Ask printer number for every print (normal mode).")
 
     ap.add_argument("--max-orders", type=int, default=0,
                     help="Optional limit for debugging (0 = no limit).")
 
-    # NEW: print360 mode
     ap.add_argument("--print360", action="store_true",
                     help="Special mode: print up to 360 pages with no user intervention (except choosing printer).")
+    ap.add_argument("--print720", action="store_true",
+                    help="Special mode: dry-run split then print ~360 pages on printer1 and ~360 on printer2 concurrently.")
 
     args = ap.parse_args()
 
     orders = read_orders_csv(args.orders_csv)
+    if args.max_orders:
+        orders = orders[:args.max_orders]
+
     links = load_links_json(args.links_json)
     itemid_index = build_itemid_index(links)
 
+    # scan PDFs from two folders, dedupe by normalized base name (folder1 wins ties)
     pdfs_1 = list_pdfs(args.pdf_folder, args.recursive)
-
     pdfs_2: List[PdfEntry] = []
     if args.pdf_folder2 and args.pdf_folder2.exists():
         pdfs_2 = list_pdfs(args.pdf_folder2, args.recursive)
 
-    # Merge + deduplicate by normalized base name (same rule as before)
     pdfs_by_norm: Dict[str, PdfEntry] = {}
     for p in pdfs_1 + pdfs_2:
         key = _norm(p.base)
         if key not in pdfs_by_norm:
             pdfs_by_norm[key] = p
-
     pdfs = list(pdfs_by_norm.values())
 
     if not pdfs:
@@ -636,12 +820,10 @@ def main():
         )
         sys.exit(2)
 
-    # quick lookup for pdf base -> PdfEntry
     pdf_by_normbase: Dict[str, PdfEntry] = {_norm(p.base): p for p in pdfs}
 
-    # optional printed-manual inventory load (not used by print360 logic)
     manuals_map = load_manuals_from_csv_any(args.manuals_csv)
-    manuals_list = list(manuals_map.values())
+    _ = manuals_map  # kept for your other features (not required here)
 
     print(f"Loaded {len(orders)} orders from: {args.orders_csv}")
     print(f"Loaded {len(links)} existing link entries from: {args.links_json}")
@@ -651,17 +833,79 @@ def main():
         f"  - {args.pdf_folder2}\n"
         f"(recursive={args.recursive})"
     )
-    if args.manuals_csv and args.manuals_csv.exists():
-        print(f"Loaded {len(manuals_list)} printed-manual inventory entries from: {args.manuals_csv}")
 
-    # Printer selection behavior
     default_printer = (args.printer or "").strip()
 
     # ----------------------------
-    # print360 mode
+    # print720 mode
+    # ----------------------------
+    if args.print720:
+        # only user intervention allowed in this mode: selecting printers
+        printer1 = default_printer
+        printer2 = (args.printer2 or "").strip()
+
+        if not printer1:
+            printer1 = input("\n[print720] Printer 1 number (e.g. 1): ").strip()
+        if not printer2:
+            printer2 = input("[print720] Printer 2 number (e.g. 2): ").strip()
+
+        if not printer1:
+            print("[print720] ERROR: printer1 is required.")
+            sys.exit(2)
+        # printer2 may be empty in theory, but mode concept expects it; keep strict:
+        if not printer2:
+            print("[print720] ERROR: printer2 is required.")
+            sys.exit(2)
+
+        # Stream position is in ELIGIBLE DOC LIST coordinates.
+        # Start at the beginning each run; within a run we support "continue printing" in a loop.
+        stream_pos = PrintStreamPos(doc_list_index=0, next_page=1)
+
+        while True:
+            plan = plan_print720(
+                orders=orders,
+                itemid_index=itemid_index,
+                pdf_by_normbase=pdf_by_normbase,
+                start_pos=stream_pos,
+                limit_each=360,
+            )
+
+            _print_plan_summary(plan)
+            total_pages = plan.printed_p1 + plan.printed_p2
+
+            if total_pages <= 0:
+                print("\n[print720] Nothing eligible to print. Exiting.")
+                break
+
+            # execute concurrently based on the plan
+            execute_print720(
+                plan=plan,
+                printer1=printer1,
+                printer2=printer2,
+                pdfs=pdfs,
+                myprint_path=args.myprint,
+                python_exe=args.python,
+            )
+
+            # advance stream position for potential next batch
+            stream_pos = plan.end_pos
+
+            # Ask to continue only if there is more beyond this ~720 batch
+            if plan.has_more:
+                ans = input("\n[print720] Do you want to continue printing the next batch? [y/N]: ").strip().lower()
+                if not ans.startswith("y"):
+                    break
+            else:
+                print("\n[print720] No more eligible pages after this batch. Done.")
+                break
+
+        save_links_json(args.out_links_json, links)
+        return
+
+    # ----------------------------
+    # print360 mode (existing behavior)
     # ----------------------------
     if args.print360:
-        # In print360 mode we always print, and there is only ONE user choice: printer.
         args.do_print = True
         args.always_ask_printer = False
 
@@ -671,15 +915,9 @@ def main():
             print("[print360] ERROR: printer is required.")
             sys.exit(2)
 
-        start_idx = 0
-        if args.max_orders:
-            # In print360 mode, max-orders still applies as a safety limit.
-            orders = orders[:args.max_orders]
-
-        # 1) Run one 360-page batch
         next_idx, pages_printed, resume = run_print360_batch(
             orders=orders,
-            start_index=start_idx,
+            start_index=0,
             itemid_index=itemid_index,
             pdf_by_normbase=pdf_by_normbase,
             pdfs=pdfs,
@@ -691,9 +929,6 @@ def main():
 
         print(f"\n[print360] Batch complete. Pages printed in this batch: {pages_printed}/360")
 
-        # If we hit 360 exactly (or reached capacity), ask whether to continue later.
-        # Your requirement: after 360 pages, ask "do you want to continue?"
-        # If yes: finish the partial manual (if any), then continue in NORMAL MODE from the next order.
         if pages_printed >= 360:
             ans = input("\n[print360] Do you want to continue later? [y/N]: ").strip().lower()
             if not ans.startswith("y"):
@@ -701,7 +936,6 @@ def main():
                 print("[print360] Stopping (no continue).")
                 return
 
-            # Finish the remainder of the partially printed manual (if any)
             if resume is not None:
                 finish_resume_manual(
                     resume=resume,
@@ -710,27 +944,15 @@ def main():
                     myprint_path=args.myprint,
                     python_exe=args.python,
                 )
-                # After finishing, we continue AFTER that order.
                 next_idx = resume.order_index + 1
-            else:
-                # No partial manual; just continue from next_idx as returned.
-                pass
 
-            # Switch to NORMAL MODE (interactive) for remaining orders, skipping what was already printed
             print("\n[print360] Continuing in NORMAL MODE from remaining orders...\n")
-
         else:
-            # Did not fill 360 (ran out of printable items). Continue in normal mode automatically.
-            print("\n[print360] Did not reach 360 pages (no more eligible items). Continuing in NORMAL MODE...\n")
+            print("\n[print360] Did not reach 360 pages. Continuing in NORMAL MODE...\n")
 
-        # From here: proceed to NORMAL MODE starting at next_idx
         start_index_for_normal = next_idx
-
     else:
-        # Not in print360 mode; start from beginning
         start_index_for_normal = 0
-
-        # Normal mode printer default prompt
         if args.do_print and not default_printer and not args.always_ask_printer:
             default_printer = input("\nDefault printer number for this run (e.g. 1 or 2): ").strip()
 
@@ -740,13 +962,8 @@ def main():
     updated = 0
     processed = 0
 
-    # If max-orders in normal mode, apply as originally (debug)
-    normal_orders = orders
-    if args.max_orders and not args.print360:
-        normal_orders = orders[:args.max_orders]
-
-    for i in range(start_index_for_normal, len(normal_orders)):
-        row = normal_orders[i]
+    for i in range(start_index_for_normal, len(orders)):
+        row = orders[i]
         processed += 1
 
         title = (row.get("title") or "").strip()
@@ -758,7 +975,6 @@ def main():
 
         chosen_pdf: Optional[PdfEntry] = None
 
-        # Short-circuit if item_id already known in links JSON (no fuzzy match)
         if item_id and item_id in itemid_index:
             known_pdf_base = itemid_index[item_id]
             chosen_pdf = pdf_by_normbase.get(_norm(known_pdf_base))
@@ -774,7 +990,6 @@ def main():
                 )
                 chosen_pdf = None
 
-        # Fallback: normal fuzzy matching
         if chosen_pdf is None:
             cands = top_candidates(title, pdfs, k=3)
             chosen_pdf = choose_match_interactive(title, cands, args.min_score, args.min_margin)
@@ -782,17 +997,15 @@ def main():
                 print("No match selected. Moving on.")
                 continue
 
-        # Update links JSON: key = PDF base name
         links.setdefault(chosen_pdf.base, {})
         links[chosen_pdf.base]["url"] = url
         if item_id:
             links[chosen_pdf.base]["item_id"] = item_id
-            itemid_index[item_id] = chosen_pdf.base  # keep index fresh
+            itemid_index[item_id] = chosen_pdf.base
 
         updated += 1
         print(f"Linked: {chosen_pdf.base}  ->  {url}   (item_id={item_id})")
 
-        # Printing workflow (normal mode)
         if args.do_print:
             act = input("Print now? [P]rint / [S]kip / [Q]uit printing: ").strip().lower()
             if act == "":
@@ -828,4 +1041,3 @@ def main():
 
 if __name__ == "__main__":
     main()
-
