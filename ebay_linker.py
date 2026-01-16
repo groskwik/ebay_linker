@@ -1,23 +1,26 @@
-##!/usr/bin/env python3
+#!/usr/bin/env python
+#!/usr/bin/env python3
 # -*- coding: utf-8 -*-
 from __future__ import annotations
 
 import argparse
 import csv
 import json
+import os
 import re
 import subprocess
 import sys
+import time
+from concurrent.futures import ThreadPoolExecutor, as_completed
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Dict, List, Optional, Tuple
 from urllib.parse import urlparse
-from concurrent.futures import ThreadPoolExecutor, as_completed
 
 
-# ----------------------------
+# =============================================================================
 # Normalization / similarity
-# ----------------------------
+# =============================================================================
 
 _STOPWORDS = {
     "the", "a", "an", "and", "or", "for", "to", "of", "in", "on", "with",
@@ -67,9 +70,9 @@ def similarity_score(title: str, other: str) -> float:
     return 100.0 * (0.55 * r + 0.45 * j)
 
 
-# ----------------------------
+# =============================================================================
 # URL -> item_id helper
-# ----------------------------
+# =============================================================================
 
 RE_ITM = re.compile(r"/itm/(\d+)")
 
@@ -82,9 +85,9 @@ def extract_item_id_from_url(url: str) -> str:
     return m.group(1) if m else ""
 
 
-# ----------------------------
+# =============================================================================
 # PDF inventory
-# ----------------------------
+# =============================================================================
 
 @dataclass
 class PdfEntry:
@@ -111,7 +114,7 @@ def list_pdfs(folder: Path, recursive: bool) -> List[PdfEntry]:
 def get_pdf_pagecount(pdf_path: Path) -> Optional[int]:
     """
     Return number of pages in PDF (int) or None if unreadable.
-    Uses pypdf if available.
+    Uses pypdf if available, otherwise PyPDF2.
     """
     try:
         from pypdf import PdfReader  # type: ignore
@@ -130,9 +133,9 @@ def get_pdf_pagecount(pdf_path: Path) -> Optional[int]:
         return None
 
 
-# ----------------------------
+# =============================================================================
 # Links JSON (pdf_base -> {url, item_id, ...})
-# ----------------------------
+# =============================================================================
 
 def load_links_json(path: Path) -> Dict[str, Dict[str, str]]:
     if not path.exists():
@@ -155,26 +158,45 @@ def save_links_json(path: Path, data: Dict[str, Dict[str, str]]) -> None:
         json.dump(data, f, indent=2, ensure_ascii=False)
     print(f"\nSaved links JSON: {path}")
 
-def build_itemid_index(links: Dict[str, Dict[str, str]]) -> Dict[str, str]:
+def _as_bool(v: object) -> bool:
+    if isinstance(v, bool):
+        return v
+    if v is None:
+        return False
+    s = str(v).strip().lower()
+    return s in ("1", "true", "yes", "y", "on")
+
+def build_itemid_index_and_flags(links: Dict[str, Dict[str, str]]) -> Tuple[Dict[str, str], Dict[str, bool]]:
     """
-    Build map: item_id -> pdf_base_name
+    Build:
+      - item_id -> pdf_base_name
+      - item_id -> typewriter_flag (default False)
+
     Uses explicit 'item_id' field if present, else extracts from 'url' if possible.
+    For typewriter flag: optional 'typewriter' entry in the PDF record (links json), default False.
     """
     idx: Dict[str, str] = {}
+    tw: Dict[str, bool] = {}
+
     for pdf_base, rec in links.items():
         if not isinstance(rec, dict):
             continue
+
         item_id = (rec.get("item_id") or "").strip()
         if not item_id:
             item_id = extract_item_id_from_url(rec.get("url", ""))
-        if item_id:
-            idx[item_id] = pdf_base
-    return idx
+        if not item_id:
+            continue
+
+        idx[item_id] = pdf_base
+        tw[item_id] = _as_bool(rec.get("typewriter", False))
+
+    return idx, tw
 
 
-# ----------------------------
+# =============================================================================
 # Orders CSV
-# ----------------------------
+# =============================================================================
 
 def read_orders_csv(path: Path) -> List[Dict[str, str]]:
     if not path.exists():
@@ -190,9 +212,9 @@ def read_orders_csv(path: Path) -> List[Dict[str, str]]:
     return rows
 
 
-# ----------------------------
-# Printed manual inventory CSV (optional) - kept as-is
-# ----------------------------
+# =============================================================================
+# Printed manual inventory CSV (optional) - kept for compatibility
+# =============================================================================
 
 @dataclass
 class ManualEntry:
@@ -201,6 +223,11 @@ class ManualEntry:
     cover: bool
 
 def load_manuals_from_csv_any(path: Path) -> Dict[str, ManualEntry]:
+    """
+    Supports BOTH:
+      A) Header CSV: title,box,cover
+      B) No-header CSV rows: <title>,<box>,<cover>
+    """
     out: Dict[str, ManualEntry] = {}
     if not path or not path.exists():
         return out
@@ -256,9 +283,9 @@ def load_manuals_from_csv_any(path: Path) -> Dict[str, ManualEntry]:
     return out
 
 
-# ----------------------------
-# Matching helpers (orders -> PDFs) (normal mode)
-# ----------------------------
+# =============================================================================
+# Matching helpers (normal mode only)
+# =============================================================================
 
 @dataclass
 class Candidate:
@@ -309,9 +336,9 @@ def choose_match_interactive(
         print("Invalid input. Use 1/2/3 or 0.")
 
 
-# ----------------------------
+# =============================================================================
 # myprint automation (NO changes to myprint.py)
-# ----------------------------
+# =============================================================================
 
 def find_pdf_matches_like_myprint(pdfs: List[PdfEntry], partial_name: str) -> List[PdfEntry]:
     q = (partial_name or "").strip().lower()
@@ -351,6 +378,11 @@ def myprint_auto_print_range(
     myprint_path: str,
     python_exe: Optional[str],
 ) -> int:
+    """
+    Print chosen_pdf with myprint.py without any user intervention.
+    We supply: printer, pdf_basename, optional index (if myprint would list multiple matches),
+    then page_range.
+    """
     auto_inputs: List[str] = []
     auto_inputs.append(printer)
     auto_inputs.append(chosen_pdf.base)
@@ -367,9 +399,9 @@ def myprint_auto_print_range(
     return run_myprint_with_auto_inputs(myprint_path, python_exe, auto_inputs)
 
 
-# ----------------------------
-# print360 mode (unchanged, kept for compatibility)
-# ----------------------------
+# =============================================================================
+# print360 mode (unchanged behavior)
+# =============================================================================
 
 @dataclass
 class Print360Resume:
@@ -430,8 +462,12 @@ def run_print360_batch(
             pr = f"1-{total_pages}"
             print(f"\n[print360] PRINT FULL: {pdf.base}  pages={pr}  (total={total_pages})")
             rc = myprint_auto_print_range(
-                pdfs=pdfs, chosen_pdf=pdf, printer=printer, page_range=pr,
-                myprint_path=myprint_path, python_exe=python_exe,
+                pdfs=pdfs,
+                chosen_pdf=pdf,
+                printer=printer,
+                page_range=pr,
+                myprint_path=myprint_path,
+                python_exe=python_exe,
             )
             if rc != 0:
                 print(f"[print360] WARNING: myprint exit code {rc} (continuing)")
@@ -442,7 +478,8 @@ def run_print360_batch(
         start_page = 1
         end_page = start_page + remaining_capacity - 1
         if end_page % 2 == 1:
-            end_page += 1
+            end_page += 1  # may exceed by 1 for duplex parity
+
         if end_page > total_pages:
             end_page = total_pages
             if end_page % 2 == 1 and end_page - 1 >= start_page:
@@ -453,19 +490,23 @@ def run_print360_batch(
 
         print(f"\n[print360] PRINT PARTIAL (even-ended): {pdf.base}  pages={pr}  (total={total_pages})")
         rc = myprint_auto_print_range(
-            pdfs=pdfs, chosen_pdf=pdf, printer=printer, page_range=pr,
-            myprint_path=myprint_path, python_exe=python_exe,
+            pdfs=pdfs,
+            chosen_pdf=pdf,
+            printer=printer,
+            page_range=pr,
+            myprint_path=myprint_path,
+            python_exe=python_exe,
         )
         if rc != 0:
             print(f"[print360] WARNING: myprint exit code {rc} (continuing)")
 
         pages_printed += printed_now
+
         if end_page < total_pages:
             resume = Print360Resume(order_index=idx, pdf=pdf, total_pages=total_pages, next_page=end_page + 1)
         break
 
-    next_start_index = idx
-    return next_start_index, pages_printed, resume
+    return idx, pages_printed, resume
 
 def finish_resume_manual(
     *,
@@ -480,20 +521,24 @@ def finish_resume_manual(
     pr = f"{resume.next_page}-{resume.total_pages}"
     print(f"\n[resume] FINISH MANUAL: {resume.pdf.base}  pages={pr}  (total={resume.total_pages})")
     rc = myprint_auto_print_range(
-        pdfs=pdfs, chosen_pdf=resume.pdf, printer=printer, page_range=pr,
-        myprint_path=myprint_path, python_exe=python_exe,
+        pdfs=pdfs,
+        chosen_pdf=resume.pdf,
+        printer=printer,
+        page_range=pr,
+        myprint_path=myprint_path,
+        python_exe=python_exe,
     )
     if rc != 0:
         print(f"[resume] WARNING: myprint exit code {rc} (continuing)")
 
 
-# ----------------------------
-# print720 mode (NEW)
-# ----------------------------
+# =============================================================================
+# print720 mode (typewriter-aware, dry run split + concurrent execution + persistent state)
+# =============================================================================
 
 @dataclass
 class EligibleDoc:
-    order_index: int     # index in the original orders list
+    order_index: int
     pdf: PdfEntry
     total_pages: int
 
@@ -513,8 +558,8 @@ class PrintTask:
 
 @dataclass
 class PrintStreamPos:
-    doc_list_index: int  # index into eligible_docs list
-    next_page: int       # next page within that doc (1-based)
+    doc_list_index: int
+    next_page: int
 
 @dataclass
 class Print720Plan:
@@ -522,14 +567,81 @@ class Print720Plan:
     tasks_p2: List[PrintTask]
     printed_p1: int
     printed_p2: int
-    end_pos: PrintStreamPos
-    has_more: bool
+    end_pos_normal: PrintStreamPos
+    end_pos_typewriter: PrintStreamPos
+    has_more_normal: bool
+    has_more_typewriter: bool
+
+@dataclass
+class Print720State:
+    normal_doc_list_index: int = 0
+    normal_next_page: int = 1
+    typewriter_doc_list_index: int = 0
+    typewriter_next_page: int = 1
+
+    def normal_pos(self) -> PrintStreamPos:
+        return PrintStreamPos(self.normal_doc_list_index, self.normal_next_page)
+
+    def typewriter_pos(self) -> PrintStreamPos:
+        return PrintStreamPos(self.typewriter_doc_list_index, self.typewriter_next_page)
+
+    @classmethod
+    def from_positions(cls, normal: PrintStreamPos, typewriter: PrintStreamPos) -> "Print720State":
+        return cls(
+            normal_doc_list_index=normal.doc_list_index,
+            normal_next_page=normal.next_page,
+            typewriter_doc_list_index=typewriter.doc_list_index,
+            typewriter_next_page=typewriter.next_page,
+        )
+
+def load_print720_state(path: Path) -> Print720State:
+    if not path.exists():
+        return Print720State()
+    try:
+        with path.open("r", encoding="utf-8") as f:
+            data = json.load(f)
+        if not isinstance(data, dict):
+            return Print720State()
+        return Print720State(
+            normal_doc_list_index=int(data.get("normal_doc_list_index", 0)),
+            normal_next_page=int(data.get("normal_next_page", 1)),
+            typewriter_doc_list_index=int(data.get("typewriter_doc_list_index", 0)),
+            typewriter_next_page=int(data.get("typewriter_next_page", 1)),
+        )
+    except Exception as e:
+        print(f"[print720] WARNING: failed to load state file {path}: {e}")
+        return Print720State()
+
+def save_print720_state(path: Path, state: Print720State) -> None:
+    try:
+        payload = {
+            "normal_doc_list_index": int(state.normal_doc_list_index),
+            "normal_next_page": int(state.normal_next_page),
+            "typewriter_doc_list_index": int(state.typewriter_doc_list_index),
+            "typewriter_next_page": int(state.typewriter_next_page),
+            "saved_at": int(time.time()),
+        }
+        with path.open("w", encoding="utf-8") as f:
+            json.dump(payload, f, indent=2)
+        print(f"[print720] Saved state: {path}")
+    except Exception as e:
+        print(f"[print720] WARNING: failed to save state file {path}: {e}")
+
+def reset_print720_state(path: Path) -> None:
+    try:
+        if path.exists():
+            path.unlink()
+            print(f"[print720] Reset state (deleted): {path}")
+    except Exception as e:
+        print(f"[print720] WARNING: failed to delete state file {path}: {e}")
 
 def _build_eligible_docs(
     *,
     orders: List[Dict[str, str]],
     itemid_index: Dict[str, str],
+    itemid_typewriter: Dict[str, bool],
     pdf_by_normbase: Dict[str, PdfEntry],
+    want_typewriter: bool,
 ) -> List[EligibleDoc]:
     out: List[EligibleDoc] = []
     for i, row in enumerate(orders):
@@ -539,8 +651,11 @@ def _build_eligible_docs(
 
         if not title or not url:
             continue
-
         if not item_id or item_id not in itemid_index:
+            continue
+
+        is_tw = bool(itemid_typewriter.get(item_id, False))
+        if want_typewriter != is_tw:
             continue
 
         pdf_base = itemid_index[item_id]
@@ -556,7 +671,6 @@ def _build_eligible_docs(
     return out
 
 def _advance_pos(docs: List[EligibleDoc], pos: PrintStreamPos) -> PrintStreamPos:
-    # If next_page is past total, move to next doc
     while pos.doc_list_index < len(docs):
         d = docs[pos.doc_list_index]
         if pos.next_page <= d.total_pages:
@@ -570,16 +684,10 @@ def _plan_for_one_printer(
     start_pos: PrintStreamPos,
     page_limit: int,
     force_even_end_if_cut: bool = True,
-) -> Tuple[List[PrintTask], int, PrintStreamPos, bool]:
-    """
-    Plans print tasks for one printer by consuming up to page_limit pages from the stream.
-    If the allocation ends mid-document, it forces end_page to an even number (may add 1 page).
-    Returns: (tasks, pages_allocated, end_pos, ended_on_cut)
-    """
+) -> Tuple[List[PrintTask], int, PrintStreamPos]:
     tasks: List[PrintTask] = []
     allocated = 0
     pos = _advance_pos(docs, start_pos)
-    ended_on_cut = False
 
     while pos.doc_list_index < len(docs) and allocated < page_limit:
         d = docs[pos.doc_list_index]
@@ -587,8 +695,8 @@ def _plan_for_one_printer(
         remaining_in_doc = d.total_pages - start_page + 1
         remaining_capacity = page_limit - allocated
 
+        # take rest of doc
         if remaining_in_doc <= remaining_capacity:
-            # Take the rest of the doc
             end_page = d.total_pages
             tasks.append(PrintTask(pdf=d.pdf, start_page=start_page, end_page=end_page))
             allocated += (end_page - start_page + 1)
@@ -596,15 +704,13 @@ def _plan_for_one_printer(
             pos = _advance_pos(docs, pos)
             continue
 
-        # Need to cut inside the doc
+        # cut inside doc
         end_page = start_page + remaining_capacity - 1
-
         if force_even_end_if_cut and (end_page % 2 == 1):
-            end_page += 1  # may exceed limit by 1, but preserves duplex parity
+            end_page += 1  # may exceed by 1 for duplex parity
 
         if end_page > d.total_pages:
             end_page = d.total_pages
-            # if clamped to odd total, step down to even when possible
             if force_even_end_if_cut and (end_page % 2 == 1) and (end_page - 1 >= start_page):
                 end_page -= 1
 
@@ -612,50 +718,80 @@ def _plan_for_one_printer(
         allocated += max(0, end_page - start_page + 1)
         pos = PrintStreamPos(doc_list_index=pos.doc_list_index, next_page=end_page + 1)
         pos = _advance_pos(docs, pos)
-        ended_on_cut = True
         break
 
-    return tasks, allocated, pos, ended_on_cut
+    return tasks, allocated, pos
 
 def plan_print720(
     *,
     orders: List[Dict[str, str]],
     itemid_index: Dict[str, str],
+    itemid_typewriter: Dict[str, bool],
     pdf_by_normbase: Dict[str, PdfEntry],
-    start_pos: PrintStreamPos,
+    start_pos_normal: PrintStreamPos,
+    start_pos_typewriter: PrintStreamPos,
     limit_each: int = 360,
+    typewriter_printer: int = 0,   # 0=none, 1=printer1, 2=printer2
 ) -> Print720Plan:
-    """
-    Dry-run planner:
-      - Builds eligible docs (item must be in links DB, PDF exists, page count readable)
-      - Consumes the stream:
-          first limit_each pages -> printer 1
-          next  limit_each pages -> printer 2
-      - Cuts inside a doc end on even page (duplex parity) when needed.
-    """
-    docs = _build_eligible_docs(orders=orders, itemid_index=itemid_index, pdf_by_normbase=pdf_by_normbase)
+    docs_normal = _build_eligible_docs(
+        orders=orders,
+        itemid_index=itemid_index,
+        itemid_typewriter=itemid_typewriter,
+        pdf_by_normbase=pdf_by_normbase,
+        want_typewriter=False,
+    )
+    docs_tw = _build_eligible_docs(
+        orders=orders,
+        itemid_index=itemid_index,
+        itemid_typewriter=itemid_typewriter,
+        pdf_by_normbase=pdf_by_normbase,
+        want_typewriter=True,
+    )
 
-    # start_pos is in the "eligible docs stream" coordinates
-    pos0 = _advance_pos(docs, start_pos)
+    posN0 = _advance_pos(docs_normal, start_pos_normal)
+    posT0 = _advance_pos(docs_tw, start_pos_typewriter)
 
-    t1, p1, pos1, _ = _plan_for_one_printer(docs=docs, start_pos=pos0, page_limit=limit_each, force_even_end_if_cut=True)
-    t2, p2, pos2, _ = _plan_for_one_printer(docs=docs, start_pos=pos1, page_limit=limit_each, force_even_end_if_cut=True)
+    # Decide what each printer prints based on typewriter_printer
+    if typewriter_printer == 1:
+        # P1 = typewriter only, P2 = normal only
+        t1, p1, posT1 = _plan_for_one_printer(docs=docs_tw, start_pos=posT0, page_limit=limit_each, force_even_end_if_cut=True)
+        t2, p2, posN1 = _plan_for_one_printer(docs=docs_normal, start_pos=posN0, page_limit=limit_each, force_even_end_if_cut=True)
+        endN = posN1
+        endT = posT1
+    elif typewriter_printer == 2:
+        # P2 = typewriter only, P1 = normal only
+        t1, p1, posN1 = _plan_for_one_printer(docs=docs_normal, start_pos=posN0, page_limit=limit_each, force_even_end_if_cut=True)
+        t2, p2, posT1 = _plan_for_one_printer(docs=docs_tw, start_pos=posT0, page_limit=limit_each, force_even_end_if_cut=True)
+        endN = posN1
+        endT = posT1
+    else:
+        # No typewriter printer => behave like original: both printers consume the NORMAL stream sequentially
+        t1, p1, posN1 = _plan_for_one_printer(docs=docs_normal, start_pos=posN0, page_limit=limit_each, force_even_end_if_cut=True)
+        t2, p2, posN2 = _plan_for_one_printer(docs=docs_normal, start_pos=posN1, page_limit=limit_each, force_even_end_if_cut=True)
+        endN = posN2
+        endT = posT0  # unchanged
 
-    # Do we have more after this batch?
-    pos2a = _advance_pos(docs, pos2)
-    has_more = pos2a.doc_list_index < len(docs)
+    endN = _advance_pos(docs_normal, endN)
+    endT = _advance_pos(docs_tw, endT)
+
+    has_more_normal = endN.doc_list_index < len(docs_normal)
+    has_more_typewriter = endT.doc_list_index < len(docs_tw)
 
     return Print720Plan(
         tasks_p1=t1,
         tasks_p2=t2,
         printed_p1=p1,
         printed_p2=p2,
-        end_pos=pos2a,
-        has_more=has_more,
+        end_pos_normal=endN,
+        end_pos_typewriter=endT,
+        has_more_normal=has_more_normal,
+        has_more_typewriter=has_more_typewriter,
     )
 
-def _print_plan_summary(plan: Print720Plan) -> None:
+def _print_plan_summary(plan: Print720Plan, typewriter_printer: int) -> None:
+    tw_note = {0: "none", 1: "printer1", 2: "printer2"}.get(typewriter_printer, "none")
     print("\n[print720] Dry run plan:")
+    print(f"  Typewriter printer: {tw_note}")
     print(f"  Printer 1 pages: {plan.printed_p1} (target ~360, may be 361 for duplex)")
     for t in plan.tasks_p1:
         print(f"    - {t.pdf.base}: {t.page_range}  ({t.pages} pages)")
@@ -672,10 +808,6 @@ def _run_tasks_for_printer(
     python_exe: Optional[str],
     tag: str,
 ) -> int:
-    """
-    Runs a list of tasks sequentially for one printer.
-    Returns last non-zero rc if any; else 0.
-    """
     last_rc = 0
     for t in tasks:
         print(f"\n[{tag}] PRINT: {t.pdf.base}  pages={t.page_range}  on printer={printer}")
@@ -701,27 +833,32 @@ def execute_print720(
     myprint_path: str,
     python_exe: Optional[str],
 ) -> None:
-    """
-    Executes printer 1 and printer 2 queues concurrently (when both have tasks).
-    If only one queue has tasks, runs only that one.
-    """
     has1 = len(plan.tasks_p1) > 0
     has2 = len(plan.tasks_p2) > 0
 
     if has1 and has2:
         print("\n[print720] Starting BOTH printers concurrently...")
         with ThreadPoolExecutor(max_workers=2) as ex:
-            futs = []
-            futs.append(ex.submit(
-                _run_tasks_for_printer,
-                printer=printer1, tasks=plan.tasks_p1, pdfs=pdfs,
-                myprint_path=myprint_path, python_exe=python_exe, tag="P1"
-            ))
-            futs.append(ex.submit(
-                _run_tasks_for_printer,
-                printer=printer2, tasks=plan.tasks_p2, pdfs=pdfs,
-                myprint_path=myprint_path, python_exe=python_exe, tag="P2"
-            ))
+            futs = [
+                ex.submit(
+                    _run_tasks_for_printer,
+                    printer=printer1,
+                    tasks=plan.tasks_p1,
+                    pdfs=pdfs,
+                    myprint_path=myprint_path,
+                    python_exe=python_exe,
+                    tag="P1",
+                ),
+                ex.submit(
+                    _run_tasks_for_printer,
+                    printer=printer2,
+                    tasks=plan.tasks_p2,
+                    pdfs=pdfs,
+                    myprint_path=myprint_path,
+                    python_exe=python_exe,
+                    tag="P2",
+                ),
+            ]
             for f in as_completed(futs):
                 _ = f.result()
         print("\n[print720] Both printer queues completed.")
@@ -730,25 +867,33 @@ def execute_print720(
     if has1:
         print("\n[print720] Only Printer 1 has work; running Printer 1 queue...")
         _run_tasks_for_printer(
-            printer=printer1, tasks=plan.tasks_p1, pdfs=pdfs,
-            myprint_path=myprint_path, python_exe=python_exe, tag="P1"
+            printer=printer1,
+            tasks=plan.tasks_p1,
+            pdfs=pdfs,
+            myprint_path=myprint_path,
+            python_exe=python_exe,
+            tag="P1",
         )
         return
 
     if has2:
         print("\n[print720] Only Printer 2 has work; running Printer 2 queue...")
         _run_tasks_for_printer(
-            printer=printer2, tasks=plan.tasks_p2, pdfs=pdfs,
-            myprint_path=myprint_path, python_exe=python_exe, tag="P2"
+            printer=printer2,
+            tasks=plan.tasks_p2,
+            pdfs=pdfs,
+            myprint_path=myprint_path,
+            python_exe=python_exe,
+            tag="P2",
         )
         return
 
     print("\n[print720] No eligible pages to print in this batch.")
 
 
-# ----------------------------
+# =============================================================================
 # Main
-# ----------------------------
+# =============================================================================
 
 def main():
     ap = argparse.ArgumentParser()
@@ -757,11 +902,19 @@ def main():
     ap.add_argument("--links-json", required=True, type=Path)
     ap.add_argument("--out-links-json", required=True, type=Path)
 
-    ap.add_argument("--pdf-folder", type=Path, default=Path(r"c:\Users\benoi\Downloads\ebay_manuals"),
-                    help="Folder containing PDFs (default: c:\\Users\\benoi\\Downloads\\ebay_manuals)")
-    ap.add_argument("--pdf-folder2", type=Path, default=Path(r"c:\Users\benoi\Downloads\Manuals"),
-                    help="Optional second PDF folder (default: c:\\Users\\benoi\\Downloads\\Manuals)")
-    ap.add_argument("--recursive", action="store_true", help="Scan PDFs recursively under --pdf-folder")
+    ap.add_argument(
+        "--pdf-folder",
+        type=Path,
+        default=Path(r"c:\Users\benoi\Downloads\ebay_manuals"),
+        help="Folder containing PDFs (default: c:\\Users\\benoi\\Downloads\\ebay_manuals)",
+    )
+    ap.add_argument(
+        "--pdf-folder2",
+        type=Path,
+        default=Path(r"c:\Users\benoi\Downloads\Manuals"),
+        help="Optional second PDF folder (default: c:\\Users\\benoi\\Downloads\\Manuals)",
+    )
+    ap.add_argument("--recursive", action="store_true", help="Scan PDFs recursively under both folders")
 
     ap.add_argument("--min-score", type=float, default=60.0)
     ap.add_argument("--min-margin", type=float, default=8.0)
@@ -776,7 +929,7 @@ def main():
     ap.add_argument("--python", default=None,
                     help="Python executable to run myprint.py (default: current interpreter).")
 
-    ap.add_argument("--printer", type=str, default="", help="Default printer selection (e.g. 1 or 2).")
+    ap.add_argument("--printer", type=str, default="", help="Default printer selection (e.g. 1).")
     ap.add_argument("--printer2", type=str, default="", help="Second printer selection (print720 mode).")
     ap.add_argument("--always-ask-printer", action="store_true",
                     help="Ask printer number for every print (normal mode).")
@@ -788,6 +941,26 @@ def main():
                     help="Special mode: print up to 360 pages with no user intervention (except choosing printer).")
     ap.add_argument("--print720", action="store_true",
                     help="Special mode: dry-run split then print ~360 pages on printer1 and ~360 on printer2 concurrently.")
+    ap.add_argument(
+        "--print720-state",
+        type=Path,
+        default=Path("print720_state.json"),
+        help="print720 persistent state JSON file (default: print720_state.json in current directory)",
+    )
+    ap.add_argument(
+        "--print720-reset",
+        action="store_true",
+        help="Reset print720 progress (delete state file) and start from the beginning",
+    )
+    ap.add_argument(
+        "--typewriter",
+        type=int,
+        choices=(0, 1, 2),
+        default=0,
+        help="For print720 only: select which printer is the 'typewriter' (old toner). "
+             "0=none, 1=printer1, 2=printer2. The typewriter printer prints ONLY manuals "
+             "with links-json flag {\"typewriter\": true} (optional; default false).",
+    )
 
     args = ap.parse_args()
 
@@ -796,7 +969,7 @@ def main():
         orders = orders[:args.max_orders]
 
     links = load_links_json(args.links_json)
-    itemid_index = build_itemid_index(links)
+    itemid_index, itemid_typewriter = build_itemid_index_and_flags(links)
 
     # scan PDFs from two folders, dedupe by normalized base name (folder1 wins ties)
     pdfs_1 = list_pdfs(args.pdf_folder, args.recursive)
@@ -822,8 +995,7 @@ def main():
 
     pdf_by_normbase: Dict[str, PdfEntry] = {_norm(p.base): p for p in pdfs}
 
-    manuals_map = load_manuals_from_csv_any(args.manuals_csv)
-    _ = manuals_map  # kept for your other features (not required here)
+    _ = load_manuals_from_csv_any(args.manuals_csv)
 
     print(f"Loaded {len(orders)} orders from: {args.orders_csv}")
     print(f"Loaded {len(links)} existing link entries from: {args.links_json}")
@@ -836,11 +1008,10 @@ def main():
 
     default_printer = (args.printer or "").strip()
 
-    # ----------------------------
-    # print720 mode
-    # ----------------------------
+    # -------------------------------------------------------------------------
+    # print720 mode (persistent, typewriter-aware)
+    # -------------------------------------------------------------------------
     if args.print720:
-        # only user intervention allowed in this mode: selecting printers
         printer1 = default_printer
         printer2 = (args.printer2 or "").strip()
 
@@ -852,32 +1023,47 @@ def main():
         if not printer1:
             print("[print720] ERROR: printer1 is required.")
             sys.exit(2)
-        # printer2 may be empty in theory, but mode concept expects it; keep strict:
         if not printer2:
             print("[print720] ERROR: printer2 is required.")
             sys.exit(2)
 
-        # Stream position is in ELIGIBLE DOC LIST coordinates.
-        # Start at the beginning each run; within a run we support "continue printing" in a loop.
-        stream_pos = PrintStreamPos(doc_list_index=0, next_page=1)
+        typewriter_printer = int(args.typewriter or 0)
+        state_path: Path = args.print720_state
+
+        if args.print720_reset:
+            reset_print720_state(state_path)
+
+        st = load_print720_state(state_path)
+        posN = st.normal_pos()
+        posT = st.typewriter_pos()
+
+        print(
+            f"\n[print720] Starting from state:"
+            f"\n  NORMAL:     doc_list_index={posN.doc_list_index}, next_page={posN.next_page}"
+            f"\n  TYPEWRITER: doc_list_index={posT.doc_list_index}, next_page={posT.next_page}"
+        )
+        print(f"[print720] State file: {state_path.resolve()}")
 
         while True:
             plan = plan_print720(
                 orders=orders,
                 itemid_index=itemid_index,
+                itemid_typewriter=itemid_typewriter,
                 pdf_by_normbase=pdf_by_normbase,
-                start_pos=stream_pos,
+                start_pos_normal=posN,
+                start_pos_typewriter=posT,
                 limit_each=360,
+                typewriter_printer=typewriter_printer,
             )
 
-            _print_plan_summary(plan)
+            _print_plan_summary(plan, typewriter_printer)
             total_pages = plan.printed_p1 + plan.printed_p2
 
             if total_pages <= 0:
                 print("\n[print720] Nothing eligible to print. Exiting.")
+                save_print720_state(state_path, Print720State.from_positions(posN, posT))
                 break
 
-            # execute concurrently based on the plan
             execute_print720(
                 plan=plan,
                 printer1=printer1,
@@ -887,13 +1073,15 @@ def main():
                 python_exe=args.python,
             )
 
-            # advance stream position for potential next batch
-            stream_pos = plan.end_pos
+            posN = plan.end_pos_normal
+            posT = plan.end_pos_typewriter
+            save_print720_state(state_path, Print720State.from_positions(posN, posT))
 
-            # Ask to continue only if there is more beyond this ~720 batch
-            if plan.has_more:
+            has_more = plan.has_more_normal or plan.has_more_typewriter
+            if has_more:
                 ans = input("\n[print720] Do you want to continue printing the next batch? [y/N]: ").strip().lower()
                 if not ans.startswith("y"):
+                    print("[print720] Stopping now; progress saved for next run.")
                     break
             else:
                 print("\n[print720] No more eligible pages after this batch. Done.")
@@ -902,13 +1090,10 @@ def main():
         save_links_json(args.out_links_json, links)
         return
 
-    # ----------------------------
-    # print360 mode (existing behavior)
-    # ----------------------------
+    # -------------------------------------------------------------------------
+    # print360 mode
+    # -------------------------------------------------------------------------
     if args.print360:
-        args.do_print = True
-        args.always_ask_printer = False
-
         if not default_printer:
             default_printer = input("\n[print360] Printer number (e.g. 1 or 2): ").strip()
         if not default_printer:
@@ -956,9 +1141,9 @@ def main():
         if args.do_print and not default_printer and not args.always_ask_printer:
             default_printer = input("\nDefault printer number for this run (e.g. 1 or 2): ").strip()
 
-    # ----------------------------
+    # -------------------------------------------------------------------------
     # NORMAL MODE loop
-    # ----------------------------
+    # -------------------------------------------------------------------------
     updated = 0
     processed = 0
 
@@ -1002,6 +1187,9 @@ def main():
         if item_id:
             links[chosen_pdf.base]["item_id"] = item_id
             itemid_index[item_id] = chosen_pdf.base
+            # keep current typewriter map up to date (default False unless links json already had it)
+            rec = links.get(chosen_pdf.base, {})
+            itemid_typewriter[item_id] = _as_bool(rec.get("typewriter", False))
 
         updated += 1
         print(f"Linked: {chosen_pdf.base}  ->  {url}   (item_id={item_id})")
@@ -1041,3 +1229,4 @@ def main():
 
 if __name__ == "__main__":
     main()
+
