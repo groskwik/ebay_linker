@@ -8,6 +8,7 @@ import csv
 import json
 import os
 import re
+import sys, io
 import subprocess
 import sys
 import time
@@ -16,6 +17,13 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import Dict, List, Optional, Tuple
 from urllib.parse import urlparse
+
+try:
+    sys.stdout = io.TextIOWrapper(sys.stdout.buffer, encoding="utf-8", errors="replace", line_buffering=True)
+    sys.stderr = io.TextIOWrapper(sys.stderr.buffer, encoding="utf-8", errors="replace", line_buffering=True)
+except Exception:
+    pass
+
 
 
 # =============================================================================
@@ -1085,6 +1093,7 @@ def main():
                     break
             else:
                 print("\n[print720] No more eligible pages after this batch. Done.")
+                os.remove("print720_state.json")
                 break
 
         save_links_json(args.out_links_json, links)
