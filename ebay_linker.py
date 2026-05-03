@@ -5,16 +5,17 @@ from __future__ import annotations
 
 import argparse
 import csv
+import io
 import json
 import os
 import re
-import sys, io
 import subprocess
 import sys
 import time
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from dataclasses import dataclass
 from pathlib import Path
+from threading import Lock
 from typing import Dict, List, Optional, Tuple
 from urllib.parse import urlparse
 
@@ -23,7 +24,6 @@ try:
     sys.stderr = io.TextIOWrapper(sys.stderr.buffer, encoding="utf-8", errors="replace", line_buffering=True)
 except Exception:
     pass
-
 
 
 # =============================================================================
@@ -36,6 +36,7 @@ _STOPWORDS = {
     "reference", "owner", "owners", "operating", "operation",
 }
 
+
 def _norm(s: str) -> str:
     s = (s or "").strip().lower()
     if not s:
@@ -45,6 +46,7 @@ def _norm(s: str) -> str:
     s = re.sub(r"\s+", " ", s).strip()
     return s
 
+
 def _tokens(s: str) -> List[str]:
     s = _norm(s)
     if not s:
@@ -52,6 +54,7 @@ def _tokens(s: str) -> List[str]:
     toks = s.split()
     toks = [t for t in toks if t not in _STOPWORDS and len(t) >= 2]
     return toks
+
 
 def _jaccard(a: List[str], b: List[str]) -> float:
     sa, sb = set(a), set(b)
@@ -63,6 +66,7 @@ def _jaccard(a: List[str], b: List[str]) -> float:
     union = len(sa | sb)
     return inter / union if union else 0.0
 
+
 def _ratio(a: str, b: str) -> float:
     import difflib
     a2, b2 = _norm(a), _norm(b)
@@ -71,6 +75,7 @@ def _ratio(a: str, b: str) -> float:
     if not a2 or not b2:
         return 0.0
     return difflib.SequenceMatcher(None, a2, b2).ratio()
+
 
 def similarity_score(title: str, other: str) -> float:
     r = _ratio(title, other)
@@ -83,6 +88,7 @@ def similarity_score(title: str, other: str) -> float:
 # =============================================================================
 
 RE_ITM = re.compile(r"/itm/(\d+)")
+
 
 def extract_item_id_from_url(url: str) -> str:
     try:
@@ -99,8 +105,114 @@ def extract_item_id_from_url(url: str) -> str:
 
 @dataclass
 class PdfEntry:
-    base: str   # filename stem
-    path: Path  # full path
+    base: str
+    path: Path
+
+
+@dataclass
+class InventoryHit:
+    title: str
+    box: Optional[str]
+    cover: str
+
+
+@dataclass
+class SkippedInventoryRecord:
+    pdf_base: str
+    pdf_path: str
+    location: str
+
+
+class InventorySkipCollector:
+    def __init__(self) -> None:
+        self._lock = Lock()
+        self._records: Dict[str, SkippedInventoryRecord] = {}
+
+    def add(self, record: SkippedInventoryRecord) -> None:
+        key = _norm(record.pdf_base)
+        with self._lock:
+            self._records[key] = record
+
+    def has_records(self) -> bool:
+        with self._lock:
+            return bool(self._records)
+
+    def records(self) -> List[SkippedInventoryRecord]:
+        with self._lock:
+            return sorted(self._records.values(), key=lambda r: _norm(r.pdf_base))
+
+
+# =============================================================================
+# manuals.csv inventory lookup (mirrors myprint.py logic)
+# =============================================================================
+
+
+def normalize_for_db(s: str) -> str:
+    s = (s or "").lower()
+    tokens = re.findall(r"[a-z0-9]+", s)
+    return " ".join(tokens)
+
+
+DEFAULT_MANUALS_CSV = Path(r"C:\Users\benoi\Downloads\ManualForge\manuals.csv")
+
+
+class ManualsInventory:
+    def __init__(self, by_title: Dict[str, List[InventoryHit]], csv_path: Path) -> None:
+        self.by_title = by_title
+        self.csv_path = csv_path
+
+    @classmethod
+    def load(cls, csv_path: Path) -> "ManualsInventory":
+        if not csv_path.exists():
+            print(f"[inventory] manuals.csv not found at: {csv_path} (inventory check disabled)")
+            return cls({}, csv_path)
+
+        by_title: Dict[str, List[InventoryHit]] = {}
+        try:
+            with csv_path.open("r", newline="", encoding="utf-8-sig") as f:
+                reader = csv.DictReader(f)
+                for row in reader:
+                    title = (row.get("title") or "").strip()
+                    ntitle = normalize_for_db(title)
+                    if not ntitle:
+                        continue
+                    hit = InventoryHit(
+                        title=title,
+                        box=((row.get("box") or "").strip() or None),
+                        cover=(row.get("cover") or "").strip(),
+                    )
+                    by_title.setdefault(ntitle, []).append(hit)
+        except Exception as e:
+            print(f"[inventory] WARNING: failed to read manuals.csv {csv_path}: {e}")
+            return cls({}, csv_path)
+
+        return cls(by_title, csv_path)
+
+    def lookup_pdf(self, pdf: PdfEntry) -> List[InventoryHit]:
+        return list(self.by_title.get(normalize_for_db(pdf.base), []))
+
+
+def interpret_inventory_hit(hit: InventoryHit) -> str:
+    parts: List[str] = []
+    if hit.box:
+        parts.append(f"in {hit.box}")
+    if hit.cover == "1":
+        parts.append("cover-only (cover=1)")
+    elif hit.cover == "0":
+        parts.append("not cover-only (cover=0)")
+    elif hit.cover:
+        parts.append(f"cover={hit.cover}")
+
+    if not parts:
+        return "present (no box/cover info)"
+    return ", ".join(parts)
+
+
+def inventory_location_summary(hits: List[InventoryHit]) -> str:
+    if not hits:
+        return ""
+    return " | ".join(interpret_inventory_hit(h) for h in hits)
+
 
 def list_pdfs(folder: Path, recursive: bool) -> List[PdfEntry]:
     if not folder.exists():
@@ -119,11 +231,8 @@ def list_pdfs(folder: Path, recursive: bool) -> List[PdfEntry]:
         out.append(PdfEntry(base=base, path=p))
     return out
 
+
 def get_pdf_pagecount(pdf_path: Path) -> Optional[int]:
-    """
-    Return number of pages in PDF (int) or None if unreadable.
-    Uses pypdf if available, otherwise PyPDF2.
-    """
     try:
         from pypdf import PdfReader  # type: ignore
     except Exception:
@@ -145,6 +254,7 @@ def get_pdf_pagecount(pdf_path: Path) -> Optional[int]:
 # Links JSON (pdf_base -> {url, item_id, ...})
 # =============================================================================
 
+
 def load_links_json(path: Path) -> Dict[str, Dict[str, str]]:
     if not path.exists():
         return {}
@@ -161,10 +271,12 @@ def load_links_json(path: Path) -> Dict[str, Dict[str, str]]:
             out[k] = {"url": str(v)}
     return out
 
+
 def save_links_json(path: Path, data: Dict[str, Dict[str, str]]) -> None:
     with path.open("w", encoding="utf-8") as f:
         json.dump(data, f, indent=2, ensure_ascii=False)
     print(f"\nSaved links JSON: {path}")
+
 
 def _as_bool(v: object) -> bool:
     if isinstance(v, bool):
@@ -174,15 +286,8 @@ def _as_bool(v: object) -> bool:
     s = str(v).strip().lower()
     return s in ("1", "true", "yes", "y", "on")
 
-def build_itemid_index_and_flags(links: Dict[str, Dict[str, str]]) -> Tuple[Dict[str, str], Dict[str, bool]]:
-    """
-    Build:
-      - item_id -> pdf_base_name
-      - item_id -> typewriter_flag (default False)
 
-    Uses explicit 'item_id' field if present, else extracts from 'url' if possible.
-    For typewriter flag: optional 'typewriter' entry in the PDF record (links json), default False.
-    """
+def build_itemid_index_and_flags(links: Dict[str, Dict[str, str]]) -> Tuple[Dict[str, str], Dict[str, bool]]:
     idx: Dict[str, str] = {}
     tw: Dict[str, bool] = {}
 
@@ -205,6 +310,7 @@ def build_itemid_index_and_flags(links: Dict[str, Dict[str, str]]) -> Tuple[Dict
 # =============================================================================
 # Orders CSV
 # =============================================================================
+
 
 def read_orders_csv(path: Path) -> List[Dict[str, str]]:
     if not path.exists():
@@ -230,12 +336,8 @@ class ManualEntry:
     box: Optional[str]
     cover: bool
 
+
 def load_manuals_from_csv_any(path: Path) -> Dict[str, ManualEntry]:
-    """
-    Supports BOTH:
-      A) Header CSV: title,box,cover
-      B) No-header CSV rows: <title>,<box>,<cover>
-    """
     out: Dict[str, ManualEntry] = {}
     if not path or not path.exists():
         return out
@@ -300,10 +402,12 @@ class Candidate:
     pdf: PdfEntry
     score: float
 
+
 def top_candidates(title: str, pdfs: List[PdfEntry], k: int = 3) -> List[Candidate]:
     scored = [Candidate(p, similarity_score(title, p.base)) for p in pdfs]
     scored.sort(key=lambda c: c.score, reverse=True)
     return scored[:k]
+
 
 def choose_match_interactive(
     order_title: str,
@@ -345,8 +449,9 @@ def choose_match_interactive(
 
 
 # =============================================================================
-# myprint automation (NO changes to myprint.py)
+# myprint automation (with inventory-aware skip handling)
 # =============================================================================
+
 
 def find_pdf_matches_like_myprint(pdfs: List[PdfEntry], partial_name: str) -> List[PdfEntry]:
     q = (partial_name or "").strip().lower()
@@ -354,6 +459,7 @@ def find_pdf_matches_like_myprint(pdfs: List[PdfEntry], partial_name: str) -> Li
         return []
     matches = [p for p in pdfs if q in p.path.name.lower() and p.path.suffix.lower() == ".pdf"]
     return matches
+
 
 def pick_index_for_exact_basename(matches: List[PdfEntry], chosen_basename: str) -> Optional[int]:
     target_pdf = (chosen_basename or "").strip()
@@ -365,17 +471,26 @@ def pick_index_for_exact_basename(matches: List[PdfEntry], chosen_basename: str)
             return i
     return None
 
+
+@dataclass
+class MyPrintResult:
+    exit_code: int
+    skipped_in_inventory: bool = False
+    inventory_location: str = ""
+
+
 def run_myprint_with_auto_inputs(myprint_path: str, python_exe: Optional[str], auto_inputs: List[str]) -> int:
     py = python_exe or sys.executable
     cmd = [py, myprint_path]
     payload = "\n".join(auto_inputs) + "\n"
 
     print("\n=== Running myprint.py with auto inputs ===")
-    print("Command:", " ".join(f'"{c}"' if " " in c else c for c in cmd))
+    print("Command:", " ".join(f'\"{c}\"' if " " in c else c for c in cmd))
     print("Auto-inputs:", auto_inputs)
 
     completed = subprocess.run(cmd, input=payload, text=True)
     return completed.returncode
+
 
 def myprint_auto_print_range(
     *,
@@ -385,12 +500,27 @@ def myprint_auto_print_range(
     page_range: str,
     myprint_path: str,
     python_exe: Optional[str],
-) -> int:
-    """
-    Print chosen_pdf with myprint.py without any user intervention.
-    We supply: printer, pdf_basename, optional index (if myprint would list multiple matches),
-    then page_range.
-    """
+    inventory: Optional[ManualsInventory] = None,
+    skip_collector: Optional[InventorySkipCollector] = None,
+) -> MyPrintResult:
+    hits: List[InventoryHit] = []
+    if inventory is not None:
+        hits = inventory.lookup_pdf(chosen_pdf)
+
+    if hits:
+        location = inventory_location_summary(hits)
+        print(f"\n[inventory] SKIP printing '{chosen_pdf.base}' because it is already in manuals.csv")
+        print(f"[inventory] Location/info: {location}")
+        if skip_collector is not None:
+            skip_collector.add(
+                SkippedInventoryRecord(
+                    pdf_base=chosen_pdf.base,
+                    pdf_path=str(chosen_pdf.path),
+                    location=location,
+                )
+            )
+        return MyPrintResult(exit_code=0, skipped_in_inventory=True, inventory_location=location)
+
     auto_inputs: List[str] = []
     auto_inputs.append(printer)
     auto_inputs.append(chosen_pdf.base)
@@ -404,11 +534,12 @@ def myprint_auto_print_range(
         auto_inputs.append(str(idx))
 
     auto_inputs.append(page_range)
-    return run_myprint_with_auto_inputs(myprint_path, python_exe, auto_inputs)
+    rc = run_myprint_with_auto_inputs(myprint_path, python_exe, auto_inputs)
+    return MyPrintResult(exit_code=rc)
 
 
 # =============================================================================
-# print360 mode (unchanged behavior)
+# print360 mode (inventory-aware)
 # =============================================================================
 
 @dataclass
@@ -417,6 +548,7 @@ class Print360Resume:
     pdf: PdfEntry
     total_pages: int
     next_page: int
+
 
 def run_print360_batch(
     *,
@@ -429,6 +561,8 @@ def run_print360_batch(
     myprint_path: str,
     python_exe: Optional[str],
     page_limit: int = 360,
+    inventory: Optional[ManualsInventory] = None,
+    skip_collector: Optional[InventorySkipCollector] = None,
 ) -> Tuple[int, int, Optional[Print360Resume]]:
     pages_printed = 0
     idx = start_index
@@ -469,24 +603,27 @@ def run_print360_batch(
         if total_pages <= remaining_capacity:
             pr = f"1-{total_pages}"
             print(f"\n[print360] PRINT FULL: {pdf.base}  pages={pr}  (total={total_pages})")
-            rc = myprint_auto_print_range(
+            result = myprint_auto_print_range(
                 pdfs=pdfs,
                 chosen_pdf=pdf,
                 printer=printer,
                 page_range=pr,
                 myprint_path=myprint_path,
                 python_exe=python_exe,
+                inventory=inventory,
+                skip_collector=skip_collector,
             )
-            if rc != 0:
-                print(f"[print360] WARNING: myprint exit code {rc} (continuing)")
-            pages_printed += total_pages
+            if result.exit_code != 0:
+                print(f"[print360] WARNING: myprint exit code {result.exit_code} (continuing)")
+            elif not result.skipped_in_inventory:
+                pages_printed += total_pages
             idx += 1
             continue
 
         start_page = 1
         end_page = start_page + remaining_capacity - 1
         if end_page % 2 == 1:
-            end_page += 1  # may exceed by 1 for duplex parity
+            end_page += 1
 
         if end_page > total_pages:
             end_page = total_pages
@@ -497,24 +634,28 @@ def run_print360_batch(
         printed_now = (end_page - start_page + 1) if end_page >= start_page else 0
 
         print(f"\n[print360] PRINT PARTIAL (even-ended): {pdf.base}  pages={pr}  (total={total_pages})")
-        rc = myprint_auto_print_range(
+        result = myprint_auto_print_range(
             pdfs=pdfs,
             chosen_pdf=pdf,
             printer=printer,
             page_range=pr,
             myprint_path=myprint_path,
             python_exe=python_exe,
+            inventory=inventory,
+            skip_collector=skip_collector,
         )
-        if rc != 0:
-            print(f"[print360] WARNING: myprint exit code {rc} (continuing)")
+        if result.exit_code != 0:
+            print(f"[print360] WARNING: myprint exit code {result.exit_code} (continuing)")
+        elif not result.skipped_in_inventory:
+            pages_printed += printed_now
+            if end_page < total_pages:
+                resume = Print360Resume(order_index=idx, pdf=pdf, total_pages=total_pages, next_page=end_page + 1)
+                break
 
-        pages_printed += printed_now
-
-        if end_page < total_pages:
-            resume = Print360Resume(order_index=idx, pdf=pdf, total_pages=total_pages, next_page=end_page + 1)
-        break
+        idx += 1
 
     return idx, pages_printed, resume
+
 
 def finish_resume_manual(
     *,
@@ -523,21 +664,25 @@ def finish_resume_manual(
     pdfs: List[PdfEntry],
     myprint_path: str,
     python_exe: Optional[str],
+    inventory: Optional[ManualsInventory] = None,
+    skip_collector: Optional[InventorySkipCollector] = None,
 ) -> None:
     if resume.next_page > resume.total_pages:
         return
     pr = f"{resume.next_page}-{resume.total_pages}"
     print(f"\n[resume] FINISH MANUAL: {resume.pdf.base}  pages={pr}  (total={resume.total_pages})")
-    rc = myprint_auto_print_range(
+    result = myprint_auto_print_range(
         pdfs=pdfs,
         chosen_pdf=resume.pdf,
         printer=printer,
         page_range=pr,
         myprint_path=myprint_path,
         python_exe=python_exe,
+        inventory=inventory,
+        skip_collector=skip_collector,
     )
-    if rc != 0:
-        print(f"[resume] WARNING: myprint exit code {rc} (continuing)")
+    if result.exit_code != 0:
+        print(f"[resume] WARNING: myprint exit code {result.exit_code} (continuing)")
 
 
 # =============================================================================
@@ -549,6 +694,7 @@ class EligibleDoc:
     order_index: int
     pdf: PdfEntry
     total_pages: int
+
 
 @dataclass
 class PrintTask:
@@ -564,10 +710,12 @@ class PrintTask:
     def pages(self) -> int:
         return max(0, self.end_page - self.start_page + 1)
 
+
 @dataclass
 class PrintStreamPos:
     doc_list_index: int
     next_page: int
+
 
 @dataclass
 class Print720Plan:
@@ -579,6 +727,7 @@ class Print720Plan:
     end_pos_typewriter: PrintStreamPos
     has_more_normal: bool
     has_more_typewriter: bool
+
 
 @dataclass
 class Print720State:
@@ -602,6 +751,7 @@ class Print720State:
             typewriter_next_page=typewriter.next_page,
         )
 
+
 def load_print720_state(path: Path) -> Print720State:
     if not path.exists():
         return Print720State()
@@ -620,6 +770,7 @@ def load_print720_state(path: Path) -> Print720State:
         print(f"[print720] WARNING: failed to load state file {path}: {e}")
         return Print720State()
 
+
 def save_print720_state(path: Path, state: Print720State) -> None:
     try:
         payload = {
@@ -635,6 +786,7 @@ def save_print720_state(path: Path, state: Print720State) -> None:
     except Exception as e:
         print(f"[print720] WARNING: failed to save state file {path}: {e}")
 
+
 def reset_print720_state(path: Path) -> None:
     try:
         if path.exists():
@@ -642,6 +794,7 @@ def reset_print720_state(path: Path) -> None:
             print(f"[print720] Reset state (deleted): {path}")
     except Exception as e:
         print(f"[print720] WARNING: failed to delete state file {path}: {e}")
+
 
 def _build_eligible_docs(
     *,
@@ -678,6 +831,7 @@ def _build_eligible_docs(
         out.append(EligibleDoc(order_index=i, pdf=pdf, total_pages=total_pages))
     return out
 
+
 def _advance_pos(docs: List[EligibleDoc], pos: PrintStreamPos) -> PrintStreamPos:
     while pos.doc_list_index < len(docs):
         d = docs[pos.doc_list_index]
@@ -685,6 +839,7 @@ def _advance_pos(docs: List[EligibleDoc], pos: PrintStreamPos) -> PrintStreamPos
             return pos
         pos = PrintStreamPos(doc_list_index=pos.doc_list_index + 1, next_page=1)
     return pos
+
 
 def _plan_for_one_printer(
     *,
@@ -703,7 +858,6 @@ def _plan_for_one_printer(
         remaining_in_doc = d.total_pages - start_page + 1
         remaining_capacity = page_limit - allocated
 
-        # take rest of doc
         if remaining_in_doc <= remaining_capacity:
             end_page = d.total_pages
             tasks.append(PrintTask(pdf=d.pdf, start_page=start_page, end_page=end_page))
@@ -712,10 +866,9 @@ def _plan_for_one_printer(
             pos = _advance_pos(docs, pos)
             continue
 
-        # cut inside doc
         end_page = start_page + remaining_capacity - 1
         if force_even_end_if_cut and (end_page % 2 == 1):
-            end_page += 1  # may exceed by 1 for duplex parity
+            end_page += 1
 
         if end_page > d.total_pages:
             end_page = d.total_pages
@@ -730,6 +883,7 @@ def _plan_for_one_printer(
 
     return tasks, allocated, pos
 
+
 def plan_print720(
     *,
     orders: List[Dict[str, str]],
@@ -739,7 +893,7 @@ def plan_print720(
     start_pos_normal: PrintStreamPos,
     start_pos_typewriter: PrintStreamPos,
     limit_each: int = 360,
-    typewriter_printer: int = 0,   # 0=none, 1=printer1, 2=printer2
+    typewriter_printer: int = 0,
 ) -> Print720Plan:
     docs_normal = _build_eligible_docs(
         orders=orders,
@@ -759,25 +913,21 @@ def plan_print720(
     posN0 = _advance_pos(docs_normal, start_pos_normal)
     posT0 = _advance_pos(docs_tw, start_pos_typewriter)
 
-    # Decide what each printer prints based on typewriter_printer
     if typewriter_printer == 1:
-        # P1 = typewriter only, P2 = normal only
         t1, p1, posT1 = _plan_for_one_printer(docs=docs_tw, start_pos=posT0, page_limit=limit_each, force_even_end_if_cut=True)
         t2, p2, posN1 = _plan_for_one_printer(docs=docs_normal, start_pos=posN0, page_limit=limit_each, force_even_end_if_cut=True)
         endN = posN1
         endT = posT1
     elif typewriter_printer == 2:
-        # P2 = typewriter only, P1 = normal only
         t1, p1, posN1 = _plan_for_one_printer(docs=docs_normal, start_pos=posN0, page_limit=limit_each, force_even_end_if_cut=True)
         t2, p2, posT1 = _plan_for_one_printer(docs=docs_tw, start_pos=posT0, page_limit=limit_each, force_even_end_if_cut=True)
         endN = posN1
         endT = posT1
     else:
-        # No typewriter printer => behave like original: both printers consume the NORMAL stream sequentially
         t1, p1, posN1 = _plan_for_one_printer(docs=docs_normal, start_pos=posN0, page_limit=limit_each, force_even_end_if_cut=True)
         t2, p2, posN2 = _plan_for_one_printer(docs=docs_normal, start_pos=posN1, page_limit=limit_each, force_even_end_if_cut=True)
         endN = posN2
-        endT = posT0  # unchanged
+        endT = posT0
 
     endN = _advance_pos(docs_normal, endN)
     endT = _advance_pos(docs_tw, endT)
@@ -796,6 +946,7 @@ def plan_print720(
         has_more_typewriter=has_more_typewriter,
     )
 
+
 def _print_plan_summary(plan: Print720Plan, typewriter_printer: int) -> None:
     tw_note = {0: "none", 1: "printer1", 2: "printer2"}.get(typewriter_printer, "none")
     print("\n[print720] Dry run plan:")
@@ -807,6 +958,7 @@ def _print_plan_summary(plan: Print720Plan, typewriter_printer: int) -> None:
     for t in plan.tasks_p2:
         print(f"    - {t.pdf.base}: {t.page_range}  ({t.pages} pages)")
 
+
 def _run_tasks_for_printer(
     *,
     printer: str,
@@ -815,22 +967,27 @@ def _run_tasks_for_printer(
     myprint_path: str,
     python_exe: Optional[str],
     tag: str,
+    inventory: Optional[ManualsInventory] = None,
+    skip_collector: Optional[InventorySkipCollector] = None,
 ) -> int:
     last_rc = 0
     for t in tasks:
         print(f"\n[{tag}] PRINT: {t.pdf.base}  pages={t.page_range}  on printer={printer}")
-        rc = myprint_auto_print_range(
+        result = myprint_auto_print_range(
             pdfs=pdfs,
             chosen_pdf=t.pdf,
             printer=printer,
             page_range=t.page_range,
             myprint_path=myprint_path,
             python_exe=python_exe,
+            inventory=inventory,
+            skip_collector=skip_collector,
         )
-        if rc != 0:
-            last_rc = rc
-            print(f"[{tag}] WARNING: myprint exit code {rc} (continuing)")
+        if result.exit_code != 0:
+            last_rc = result.exit_code
+            print(f"[{tag}] WARNING: myprint exit code {result.exit_code} (continuing)")
     return last_rc
+
 
 def execute_print720(
     *,
@@ -840,6 +997,8 @@ def execute_print720(
     pdfs: List[PdfEntry],
     myprint_path: str,
     python_exe: Optional[str],
+    inventory: Optional[ManualsInventory] = None,
+    skip_collector: Optional[InventorySkipCollector] = None,
 ) -> None:
     has1 = len(plan.tasks_p1) > 0
     has2 = len(plan.tasks_p2) > 0
@@ -856,6 +1015,8 @@ def execute_print720(
                     myprint_path=myprint_path,
                     python_exe=python_exe,
                     tag="P1",
+                    inventory=inventory,
+                    skip_collector=skip_collector,
                 ),
                 ex.submit(
                     _run_tasks_for_printer,
@@ -865,6 +1026,8 @@ def execute_print720(
                     myprint_path=myprint_path,
                     python_exe=python_exe,
                     tag="P2",
+                    inventory=inventory,
+                    skip_collector=skip_collector,
                 ),
             ]
             for f in as_completed(futs):
@@ -881,6 +1044,8 @@ def execute_print720(
             myprint_path=myprint_path,
             python_exe=python_exe,
             tag="P1",
+            inventory=inventory,
+            skip_collector=skip_collector,
         )
         return
 
@@ -893,6 +1058,8 @@ def execute_print720(
             myprint_path=myprint_path,
             python_exe=python_exe,
             tag="P2",
+            inventory=inventory,
+            skip_collector=skip_collector,
         )
         return
 
@@ -900,8 +1067,29 @@ def execute_print720(
 
 
 # =============================================================================
+# Reporting helpers
+# =============================================================================
+
+
+def print_inventory_skip_report(skip_collector: InventorySkipCollector) -> None:
+    print("\n" + "=" * 78)
+    print("MANUALS NOT PRINTED BECAUSE THEY ARE ALREADY IN INVENTORY")
+    print("=" * 78)
+
+    if not skip_collector.has_records():
+        print("None.")
+        return
+
+    for rec in skip_collector.records():
+        print(f"- {rec.pdf_base}")
+        print(f"    PDF: {rec.pdf_path}")
+        print(f"    Location: {rec.location}")
+
+
+# =============================================================================
 # Main
 # =============================================================================
+
 
 def main():
     ap = argparse.ArgumentParser()
@@ -928,7 +1116,9 @@ def main():
     ap.add_argument("--min-margin", type=float, default=8.0)
 
     ap.add_argument("--manuals-csv", type=Path, default=Path("manuals.csv"),
-                    help="Printed-manual inventory CSV (default: manuals.csv in current directory)")
+                    help="Printed-manual inventory CSV kept for compatibility (default: manuals.csv in current directory)")
+    ap.add_argument("--inventory-csv", type=Path, default=DEFAULT_MANUALS_CSV,
+                    help="manuals.csv used to detect manuals already in inventory before calling myprint")
 
     ap.add_argument("--print", dest="do_print", action="store_true",
                     help="After selecting a PDF, run myprint.py using auto-inputs (no changes to myprint.py).")
@@ -979,7 +1169,6 @@ def main():
     links = load_links_json(args.links_json)
     itemid_index, itemid_typewriter = build_itemid_index_and_flags(links)
 
-    # scan PDFs from two folders, dedupe by normalized base name (folder1 wins ties)
     pdfs_1 = list_pdfs(args.pdf_folder, args.recursive)
     pdfs_2: List[PdfEntry] = []
     if args.pdf_folder2 and args.pdf_folder2.exists():
@@ -1004,6 +1193,8 @@ def main():
     pdf_by_normbase: Dict[str, PdfEntry] = {_norm(p.base): p for p in pdfs}
 
     _ = load_manuals_from_csv_any(args.manuals_csv)
+    inventory = ManualsInventory.load(args.inventory_csv)
+    skip_collector = InventorySkipCollector()
 
     print(f"Loaded {len(orders)} orders from: {args.orders_csv}")
     print(f"Loaded {len(links)} existing link entries from: {args.links_json}")
@@ -1013,229 +1204,236 @@ def main():
         f"  - {args.pdf_folder2}\n"
         f"(recursive={args.recursive})"
     )
+    print(f"Inventory CSV for skip detection: {inventory.csv_path}")
 
     default_printer = (args.printer or "").strip()
 
-    # -------------------------------------------------------------------------
-    # print720 mode (persistent, typewriter-aware)
-    # -------------------------------------------------------------------------
-    if args.print720:
-        printer1 = default_printer
-        printer2 = (args.printer2 or "").strip()
+    try:
+        if args.print720:
+            printer1 = default_printer
+            printer2 = (args.printer2 or "").strip()
 
-        if not printer1:
-            printer1 = input("\n[print720] Printer 1 number (e.g. 1): ").strip()
-        if not printer2:
-            printer2 = input("[print720] Printer 2 number (e.g. 2): ").strip()
+            if not printer1:
+                printer1 = input("\n[print720] Printer 1 number (e.g. 1): ").strip()
+            if not printer2:
+                printer2 = input("[print720] Printer 2 number (e.g. 2): ").strip()
 
-        if not printer1:
-            print("[print720] ERROR: printer1 is required.")
-            sys.exit(2)
-        if not printer2:
-            print("[print720] ERROR: printer2 is required.")
-            sys.exit(2)
+            if not printer1:
+                print("[print720] ERROR: printer1 is required.")
+                sys.exit(2)
+            if not printer2:
+                print("[print720] ERROR: printer2 is required.")
+                sys.exit(2)
 
-        typewriter_printer = int(args.typewriter or 0)
-        state_path: Path = args.print720_state
+            typewriter_printer = int(args.typewriter or 0)
+            state_path: Path = args.print720_state
 
-        if args.print720_reset:
-            reset_print720_state(state_path)
+            if args.print720_reset:
+                reset_print720_state(state_path)
 
-        st = load_print720_state(state_path)
-        posN = st.normal_pos()
-        posT = st.typewriter_pos()
+            st = load_print720_state(state_path)
+            posN = st.normal_pos()
+            posT = st.typewriter_pos()
 
-        print(
-            f"\n[print720] Starting from state:"
-            f"\n  NORMAL:     doc_list_index={posN.doc_list_index}, next_page={posN.next_page}"
-            f"\n  TYPEWRITER: doc_list_index={posT.doc_list_index}, next_page={posT.next_page}"
-        )
-        print(f"[print720] State file: {state_path.resolve()}")
-
-        while True:
-            plan = plan_print720(
-                orders=orders,
-                itemid_index=itemid_index,
-                itemid_typewriter=itemid_typewriter,
-                pdf_by_normbase=pdf_by_normbase,
-                start_pos_normal=posN,
-                start_pos_typewriter=posT,
-                limit_each=360,
-                typewriter_printer=typewriter_printer,
+            print(
+                f"\n[print720] Starting from state:"
+                f"\n  NORMAL:     doc_list_index={posN.doc_list_index}, next_page={posN.next_page}"
+                f"\n  TYPEWRITER: doc_list_index={posT.doc_list_index}, next_page={posT.next_page}"
             )
+            print(f"[print720] State file: {state_path.resolve()}")
 
-            _print_plan_summary(plan, typewriter_printer)
-            total_pages = plan.printed_p1 + plan.printed_p2
+            while True:
+                plan = plan_print720(
+                    orders=orders,
+                    itemid_index=itemid_index,
+                    itemid_typewriter=itemid_typewriter,
+                    pdf_by_normbase=pdf_by_normbase,
+                    start_pos_normal=posN,
+                    start_pos_typewriter=posT,
+                    limit_each=360,
+                    typewriter_printer=typewriter_printer,
+                )
 
-            if total_pages <= 0:
-                print("\n[print720] Nothing eligible to print. Exiting.")
-                save_print720_state(state_path, Print720State.from_positions(posN, posT))
-                break
+                _print_plan_summary(plan, typewriter_printer)
+                total_pages = plan.printed_p1 + plan.printed_p2
 
-            execute_print720(
-                plan=plan,
-                printer1=printer1,
-                printer2=printer2,
-                pdfs=pdfs,
-                myprint_path=args.myprint,
-                python_exe=args.python,
-            )
-
-            posN = plan.end_pos_normal
-            posT = plan.end_pos_typewriter
-            save_print720_state(state_path, Print720State.from_positions(posN, posT))
-
-            has_more = plan.has_more_normal or plan.has_more_typewriter
-            if has_more:
-                ans = input("\n[print720] Do you want to continue printing the next batch? [y/N]: ").strip().lower()
-                if not ans.startswith("y"):
-                    print("[print720] Stopping now; progress saved for next run.")
+                if total_pages <= 0:
+                    print("\n[print720] Nothing eligible to print. Exiting.")
+                    save_print720_state(state_path, Print720State.from_positions(posN, posT))
                     break
-            else:
-                print("\n[print720] No more eligible pages after this batch. Done.")
-                os.remove("print720_state.json")
-                break
 
-        save_links_json(args.out_links_json, links)
-        return
-
-    # -------------------------------------------------------------------------
-    # print360 mode
-    # -------------------------------------------------------------------------
-    if args.print360:
-        if not default_printer:
-            default_printer = input("\n[print360] Printer number (e.g. 1 or 2): ").strip()
-        if not default_printer:
-            print("[print360] ERROR: printer is required.")
-            sys.exit(2)
-
-        next_idx, pages_printed, resume = run_print360_batch(
-            orders=orders,
-            start_index=0,
-            itemid_index=itemid_index,
-            pdf_by_normbase=pdf_by_normbase,
-            pdfs=pdfs,
-            printer=default_printer,
-            myprint_path=args.myprint,
-            python_exe=args.python,
-            page_limit=360,
-        )
-
-        print(f"\n[print360] Batch complete. Pages printed in this batch: {pages_printed}/360")
-
-        if pages_printed >= 360:
-            ans = input("\n[print360] Do you want to continue later? [y/N]: ").strip().lower()
-            if not ans.startswith("y"):
-                save_links_json(args.out_links_json, links)
-                print("[print360] Stopping (no continue).")
-                return
-
-            if resume is not None:
-                finish_resume_manual(
-                    resume=resume,
-                    printer=default_printer,
+                execute_print720(
+                    plan=plan,
+                    printer1=printer1,
+                    printer2=printer2,
                     pdfs=pdfs,
                     myprint_path=args.myprint,
                     python_exe=args.python,
+                    inventory=inventory,
+                    skip_collector=skip_collector,
                 )
-                next_idx = resume.order_index + 1
 
-            print("\n[print360] Continuing in NORMAL MODE from remaining orders...\n")
-        else:
-            print("\n[print360] Did not reach 360 pages. Continuing in NORMAL MODE...\n")
+                posN = plan.end_pos_normal
+                posT = plan.end_pos_typewriter
+                save_print720_state(state_path, Print720State.from_positions(posN, posT))
 
-        start_index_for_normal = next_idx
-    else:
-        start_index_for_normal = 0
-        if args.do_print and not default_printer and not args.always_ask_printer:
-            default_printer = input("\nDefault printer number for this run (e.g. 1 or 2): ").strip()
+                has_more = plan.has_more_normal or plan.has_more_typewriter
+                if has_more:
+                    ans = input("\n[print720] Do you want to continue printing the next batch? [y/N]: ").strip().lower()
+                    if not ans.startswith("y"):
+                        print("[print720] Stopping now; progress saved for next run.")
+                        break
+                else:
+                    print("\n[print720] No more eligible pages after this batch. Done.")
+                    try:
+                        if state_path.exists():
+                            state_path.unlink()
+                    except Exception as e:
+                        print(f"[print720] WARNING: failed to delete state file {state_path}: {e}")
+                    break
 
-    # -------------------------------------------------------------------------
-    # NORMAL MODE loop
-    # -------------------------------------------------------------------------
-    updated = 0
-    processed = 0
+            save_links_json(args.out_links_json, links)
+            return
 
-    for i in range(start_index_for_normal, len(orders)):
-        row = orders[i]
-        processed += 1
+        if args.print360:
+            if not default_printer:
+                default_printer = input("\n[print360] Printer number (e.g. 1 or 2): ").strip()
+            if not default_printer:
+                print("[print360] ERROR: printer is required.")
+                sys.exit(2)
 
-        title = (row.get("title") or "").strip()
-        url = (row.get("item_url") or "").strip()
-        item_id = (row.get("item_id") or "").strip()
-
-        if not title or not url:
-            continue
-
-        chosen_pdf: Optional[PdfEntry] = None
-
-        if item_id and item_id in itemid_index:
-            known_pdf_base = itemid_index[item_id]
-            chosen_pdf = pdf_by_normbase.get(_norm(known_pdf_base))
-
-            print("\nOrder title:")
-            print(f"  {title}")
-            if chosen_pdf:
-                print(f"\nKnown item_id {item_id} already linked to PDF: {chosen_pdf.base} (skipping fuzzy match)")
-            else:
-                print(
-                    f"\nKnown item_id {item_id} is linked to '{known_pdf_base}' in links JSON, "
-                    f"but that PDF was not found in the scanned folder. Falling back to fuzzy match."
-                )
-                chosen_pdf = None
-
-        if chosen_pdf is None:
-            cands = top_candidates(title, pdfs, k=3)
-            chosen_pdf = choose_match_interactive(title, cands, args.min_score, args.min_margin)
-            if not chosen_pdf:
-                print("No match selected. Moving on.")
-                continue
-
-        links.setdefault(chosen_pdf.base, {})
-        links[chosen_pdf.base]["url"] = url
-        if item_id:
-            links[chosen_pdf.base]["item_id"] = item_id
-            itemid_index[item_id] = chosen_pdf.base
-            # keep current typewriter map up to date (default False unless links json already had it)
-            rec = links.get(chosen_pdf.base, {})
-            itemid_typewriter[item_id] = _as_bool(rec.get("typewriter", False))
-
-        updated += 1
-        print(f"Linked: {chosen_pdf.base}  ->  {url}   (item_id={item_id})")
-
-        if args.do_print:
-            act = input("Print now? [P]rint / [S]kip / [Q]uit printing: ").strip().lower()
-            if act == "":
-                act = "p"
-            if act.startswith("q"):
-                print("Printing disabled for the remainder of this run.")
-                args.do_print = False
-                continue
-            if act.startswith("s"):
-                print("Skipped printing; moving to next order.")
-                continue
-
-            prn = default_printer
-            if args.always_ask_printer or not prn:
-                prn = input("Printer number (e.g. 1 or 2): ").strip()
-
-            page_range = input("Page range for myprint (blank = default): ").strip()
-
-            rc = myprint_auto_print_range(
+            next_idx, pages_printed, resume = run_print360_batch(
+                orders=orders,
+                start_index=0,
+                itemid_index=itemid_index,
+                pdf_by_normbase=pdf_by_normbase,
                 pdfs=pdfs,
-                chosen_pdf=chosen_pdf,
-                printer=prn,
-                page_range=page_range,
+                printer=default_printer,
                 myprint_path=args.myprint,
                 python_exe=args.python,
+                page_limit=360,
+                inventory=inventory,
+                skip_collector=skip_collector,
             )
-            if rc != 0:
-                print(f"WARNING: myprint.py returned exit code {rc}. Continuing.")
 
-    save_links_json(args.out_links_json, links)
-    print(f"\nDone. Updated/added {updated} links. Processed {processed} order rows.")
+            print(f"\n[print360] Batch complete. Pages printed in this batch: {pages_printed}/360")
+
+            if pages_printed >= 360:
+                ans = input("\n[print360] Do you want to continue later? [y/N]: ").strip().lower()
+                if not ans.startswith("y"):
+                    save_links_json(args.out_links_json, links)
+                    print("[print360] Stopping (no continue).")
+                    return
+
+                if resume is not None:
+                    finish_resume_manual(
+                        resume=resume,
+                        printer=default_printer,
+                        pdfs=pdfs,
+                        myprint_path=args.myprint,
+                        python_exe=args.python,
+                        inventory=inventory,
+                        skip_collector=skip_collector,
+                    )
+                    next_idx = resume.order_index + 1
+
+                print("\n[print360] Continuing in NORMAL MODE from remaining orders...\n")
+            else:
+                print("\n[print360] Did not reach 360 pages. Continuing in NORMAL MODE...\n")
+
+            start_index_for_normal = next_idx
+        else:
+            start_index_for_normal = 0
+            if args.do_print and not default_printer and not args.always_ask_printer:
+                default_printer = input("\nDefault printer number for this run (e.g. 1 or 2): ").strip()
+
+        updated = 0
+        processed = 0
+
+        for i in range(start_index_for_normal, len(orders)):
+            row = orders[i]
+            processed += 1
+
+            title = (row.get("title") or "").strip()
+            url = (row.get("item_url") or "").strip()
+            item_id = (row.get("item_id") or "").strip()
+
+            if not title or not url:
+                continue
+
+            chosen_pdf: Optional[PdfEntry] = None
+
+            if item_id and item_id in itemid_index:
+                known_pdf_base = itemid_index[item_id]
+                chosen_pdf = pdf_by_normbase.get(_norm(known_pdf_base))
+
+                print("\nOrder title:")
+                print(f"  {title}")
+                if chosen_pdf:
+                    print(f"\nKnown item_id {item_id} already linked to PDF: {chosen_pdf.base} (skipping fuzzy match)")
+                else:
+                    print(
+                        f"\nKnown item_id {item_id} is linked to '{known_pdf_base}' in links JSON, "
+                        f"but that PDF was not found in the scanned folder. Falling back to fuzzy match."
+                    )
+                    chosen_pdf = None
+
+            if chosen_pdf is None:
+                cands = top_candidates(title, pdfs, k=3)
+                chosen_pdf = choose_match_interactive(title, cands, args.min_score, args.min_margin)
+                if not chosen_pdf:
+                    print("No match selected. Moving on.")
+                    continue
+
+            links.setdefault(chosen_pdf.base, {})
+            links[chosen_pdf.base]["url"] = url
+            if item_id:
+                links[chosen_pdf.base]["item_id"] = item_id
+                itemid_index[item_id] = chosen_pdf.base
+                rec = links.get(chosen_pdf.base, {})
+                itemid_typewriter[item_id] = _as_bool(rec.get("typewriter", False))
+
+            updated += 1
+            print(f"Linked: {chosen_pdf.base}  ->  {url}   (item_id={item_id})")
+
+            if args.do_print:
+                act = input("Print now? [P]rint / [S]kip / [Q]uit printing: ").strip().lower()
+                if act == "":
+                    act = "p"
+                if act.startswith("q"):
+                    print("Printing disabled for the remainder of this run.")
+                    args.do_print = False
+                    continue
+                if act.startswith("s"):
+                    print("Skipped printing; moving to next order.")
+                    continue
+
+                prn = default_printer
+                if args.always_ask_printer or not prn:
+                    prn = input("Printer number (e.g. 1 or 2): ").strip()
+
+                page_range = input("Page range for myprint (blank = default): ").strip()
+
+                result = myprint_auto_print_range(
+                    pdfs=pdfs,
+                    chosen_pdf=chosen_pdf,
+                    printer=prn,
+                    page_range=page_range,
+                    myprint_path=args.myprint,
+                    python_exe=args.python,
+                    inventory=inventory,
+                    skip_collector=skip_collector,
+                )
+                if result.skipped_in_inventory:
+                    print("Manual already exists in inventory. Not printed.")
+                elif result.exit_code != 0:
+                    print(f"WARNING: myprint.py returned exit code {result.exit_code}. Continuing.")
+
+        save_links_json(args.out_links_json, links)
+        print(f"\nDone. Updated/added {updated} links. Processed {processed} order rows.")
+    finally:
+        print_inventory_skip_report(skip_collector)
 
 
 if __name__ == "__main__":
     main()
-

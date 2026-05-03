@@ -6,4 +6,3 @@ python ebay_linker.py ^
   --recursive ^
   --min-score 60 ^
   --min-margin 8
-
