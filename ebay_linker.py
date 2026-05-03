@@ -1,3 +1,4 @@
+#!/usr/bin/env python
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
 from __future__ import annotations
@@ -325,6 +326,19 @@ def read_orders_csv(path: Path) -> List[Dict[str, str]]:
     return rows
 
 
+def order_item_id(row: Dict[str, str]) -> str:
+    """Return the eBay item id from the CSV column, or extract it from item_url.
+
+    Some awaiting_shipment_items.csv exports leave item_id blank. In that case,
+    the URL still usually contains /itm/<item_id>, which is enough to match
+    an existing record in ebay_links.json and avoid asking for a fuzzy match.
+    """
+    item_id = (row.get("item_id") or "").strip()
+    if item_id:
+        return item_id
+    return extract_item_id_from_url((row.get("item_url") or "").strip())
+
+
 # =============================================================================
 # Printed manual inventory CSV (optional) - kept for compatibility
 # =============================================================================
@@ -402,10 +416,18 @@ class Candidate:
     score: float
 
 
-def top_candidates(title: str, pdfs: List[PdfEntry], k: int = 3) -> List[Candidate]:
+def top_candidates(title: str, pdfs: List[PdfEntry], k: int = 0) -> List[Candidate]:
+    """Return candidates sorted by similarity.
+
+    k <= 0 means return all candidates. This is useful for the interactive
+    paged selector: show the best few first, then let the user continue down
+    the ranked list if the correct PDF is not in the first screen.
+    """
     scored = [Candidate(p, similarity_score(title, p.base)) for p in pdfs]
     scored.sort(key=lambda c: c.score, reverse=True)
-    return scored[:k]
+    if k and k > 0:
+        return scored[:k]
+    return scored
 
 
 def choose_match_interactive(
@@ -426,25 +448,62 @@ def choose_match_interactive(
     print("\nOrder title:")
     print(f"  {order_title}")
 
-    print("\nTop matches:")
-    for i, c in enumerate(cands, start=1):
-        print(f"  {i}. {c.pdf.base}   ({c.score:.1f}%)")
-
     if auto_ok:
+        print("\nTop matches:")
+        for i, c in enumerate(cands[:3], start=1):
+            print(f"  {i}. {c.pdf.base}   ({c.score:.1f}%)")
         print(f"\nAuto-selected: {best.pdf.base}  (score={best.score:.1f}%, margin={margin:.1f})")
         return best.pdf
 
+    shown = 0
+    next_batch_size = 3
+
     while True:
-        s = input("\nSelect match: 1/2/3, or 0 for no match: ").strip()
-        if s == "0":
-            return None
-        if s in ("1", "2", "3"):
-            idx = int(s) - 1
-            if idx < len(cands):
-                return cands[idx].pdf
-            print("That option is not available.")
-            continue
-        print("Invalid input. Use 1/2/3 or 0.")
+        end = min(shown + next_batch_size, len(cands))
+
+        if shown == 0:
+            print("\nTop matches:")
+        else:
+            print("\nAdditional matches:")
+
+        for i in range(shown, end):
+            c = cands[i]
+            print(f"  {i + 1}. {c.pdf.base}   ({c.score:.1f}%)")
+
+        shown = end
+        next_batch_size = 10
+
+        if shown < len(cands):
+            prompt = f"\nSelect match: 1-{shown}, type 0 to continue the list, or q to give up: "
+        else:
+            prompt = f"\nSelect match: 1-{shown}, or q to give up: "
+
+        while True:
+            s = input(prompt).strip().lower()
+
+            if s == "q":
+                return None
+
+            if s == "0":
+                if shown < len(cands):
+                    break
+                print("No more matches to show. Type a number to select, or q to give up.")
+                continue
+
+            if s.isdigit():
+                idx = int(s) - 1
+                if 0 <= idx < shown:
+                    return cands[idx].pdf
+                if 0 <= idx < len(cands):
+                    print("That option has not been shown yet. Type 0 to continue the list.")
+                else:
+                    print("That option is not available.")
+                continue
+
+            if shown < len(cands):
+                print(f"Invalid input. Use 1-{shown}, 0 to continue, or q.")
+            else:
+                print(f"Invalid input. Use 1-{shown}, or q.")
 
 
 # =============================================================================
@@ -579,7 +638,7 @@ def run_print360_batch(
     while idx < len(orders) and pages_printed < page_limit:
         row = orders[idx]
         title = (row.get("title") or "").strip()
-        item_id = (row.get("item_id") or "").strip()
+        item_id = order_item_id(row)
         url = (row.get("item_url") or "").strip()
 
         if not title or not url:
@@ -834,7 +893,7 @@ def _build_eligible_docs(
     for i, row in enumerate(orders):
         title = (row.get("title") or "").strip()
         url = (row.get("item_url") or "").strip()
-        item_id = (row.get("item_id") or "").strip()
+        item_id = order_item_id(row)
 
         if not title or not url:
             continue
@@ -1391,7 +1450,7 @@ def main():
 
             title = (row.get("title") or "").strip()
             url = (row.get("item_url") or "").strip()
-            item_id = (row.get("item_id") or "").strip()
+            item_id = order_item_id(row)
 
             if not title or not url:
                 continue
@@ -1414,7 +1473,7 @@ def main():
                     chosen_pdf = None
 
             if chosen_pdf is None:
-                cands = top_candidates(title, pdfs, k=3)
+                cands = top_candidates(title, pdfs, k=0)
                 chosen_pdf = choose_match_interactive(title, cands, args.min_score, args.min_margin)
                 if not chosen_pdf:
                     print("No match selected. Moving on.")
