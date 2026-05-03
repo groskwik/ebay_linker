@@ -1,4 +1,3 @@
-#!/usr/bin/env python
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
 from __future__ import annotations
@@ -554,6 +553,7 @@ def run_print360_batch(
     *,
     orders: List[Dict[str, str]],
     start_index: int,
+    start_resume: Optional[Print360Resume] = None,
     itemid_index: Dict[str, str],
     pdf_by_normbase: Dict[str, PdfEntry],
     pdfs: List[PdfEntry],
@@ -564,6 +564,14 @@ def run_print360_batch(
     inventory: Optional[ManualsInventory] = None,
     skip_collector: Optional[InventorySkipCollector] = None,
 ) -> Tuple[int, int, Optional[Print360Resume]]:
+    """Print one print360 batch and return the next position.
+
+    The batch stops when approximately ``page_limit`` pages have been printed.
+    If a manual is split across batches, ``resume`` points to the same order and
+    the next page to print. The caller can pass that resume back into this
+    function to continue the next 360-page batch without switching to normal
+    interactive mode.
+    """
     pages_printed = 0
     idx = start_index
     resume: Optional[Print360Resume] = None
@@ -576,11 +584,13 @@ def run_print360_batch(
 
         if not title or not url:
             idx += 1
+            start_resume = None
             continue
 
         if not item_id or item_id not in itemid_index:
             print(f"\n[print360] SKIP (not in links DB): item_id={item_id!r}  title={title}")
             idx += 1
+            start_resume = None
             continue
 
         pdf_base = itemid_index[item_id]
@@ -588,21 +598,35 @@ def run_print360_batch(
         if not pdf:
             print(f"\n[print360] SKIP (PDF not found): item_id={item_id}  pdf_base={pdf_base!r}")
             idx += 1
+            start_resume = None
             continue
 
         total_pages = get_pdf_pagecount(pdf.path)
         if not total_pages or total_pages <= 0:
             print(f"\n[print360] SKIP (cannot read page count): {pdf.path}")
             idx += 1
+            start_resume = None
+            continue
+
+        start_page = 1
+        if start_resume is not None and start_resume.order_index == idx:
+            start_page = max(1, min(start_resume.next_page, total_pages + 1))
+
+        if start_page > total_pages:
+            idx += 1
+            start_resume = None
             continue
 
         remaining_capacity = page_limit - pages_printed
         if remaining_capacity <= 0:
             break
 
-        if total_pages <= remaining_capacity:
-            pr = f"1-{total_pages}"
-            print(f"\n[print360] PRINT FULL: {pdf.base}  pages={pr}  (total={total_pages})")
+        remaining_pages = total_pages - start_page + 1
+
+        if remaining_pages <= remaining_capacity:
+            end_page = total_pages
+            pr = f"{start_page}-{end_page}"
+            print(f"\n[print360] PRINT: {pdf.base}  pages={pr}  (total={total_pages})")
             result = myprint_auto_print_range(
                 pdfs=pdfs,
                 chosen_pdf=pdf,
@@ -616,11 +640,11 @@ def run_print360_batch(
             if result.exit_code != 0:
                 print(f"[print360] WARNING: myprint exit code {result.exit_code} (continuing)")
             elif not result.skipped_in_inventory:
-                pages_printed += total_pages
+                pages_printed += remaining_pages
             idx += 1
+            start_resume = None
             continue
 
-        start_page = 1
         end_page = start_page + remaining_capacity - 1
         if end_page % 2 == 1:
             end_page += 1
@@ -646,6 +670,8 @@ def run_print360_batch(
         )
         if result.exit_code != 0:
             print(f"[print360] WARNING: myprint exit code {result.exit_code} (continuing)")
+            resume = Print360Resume(order_index=idx, pdf=pdf, total_pages=total_pages, next_page=start_page)
+            break
         elif not result.skipped_in_inventory:
             pages_printed += printed_now
             if end_page < total_pages:
@@ -653,9 +679,9 @@ def run_print360_batch(
                 break
 
         idx += 1
+        start_resume = None
 
     return idx, pages_printed, resume
-
 
 def finish_resume_manual(
     *,
@@ -1302,46 +1328,55 @@ def main():
                 print("[print360] ERROR: printer is required.")
                 sys.exit(2)
 
-            next_idx, pages_printed, resume = run_print360_batch(
-                orders=orders,
-                start_index=0,
-                itemid_index=itemid_index,
-                pdf_by_normbase=pdf_by_normbase,
-                pdfs=pdfs,
-                printer=default_printer,
-                myprint_path=args.myprint,
-                python_exe=args.python,
-                page_limit=360,
-                inventory=inventory,
-                skip_collector=skip_collector,
-            )
+            next_idx = 0
+            resume: Optional[Print360Resume] = None
+            batch_no = 1
 
-            print(f"\n[print360] Batch complete. Pages printed in this batch: {pages_printed}/360")
+            while True:
+                next_idx, pages_printed, resume = run_print360_batch(
+                    orders=orders,
+                    start_index=next_idx,
+                    start_resume=resume,
+                    itemid_index=itemid_index,
+                    pdf_by_normbase=pdf_by_normbase,
+                    pdfs=pdfs,
+                    printer=default_printer,
+                    myprint_path=args.myprint,
+                    python_exe=args.python,
+                    page_limit=360,
+                    inventory=inventory,
+                    skip_collector=skip_collector,
+                )
 
-            if pages_printed >= 360:
-                ans = input("\n[print360] Do you want to continue later? [y/N]: ").strip().lower()
-                if not ans.startswith("y"):
+                print(f"\n[print360] Batch {batch_no} complete. Pages printed in this batch: {pages_printed}/360")
+
+                has_more_orders = (resume is not None) or (next_idx < len(orders))
+                if not has_more_orders:
+                    print("\n[print360] No more eligible orders/pages after this batch. Done.")
                     save_links_json(args.out_links_json, links)
-                    print("[print360] Stopping (no continue).")
                     return
 
-                if resume is not None:
-                    finish_resume_manual(
-                        resume=resume,
-                        printer=default_printer,
-                        pdfs=pdfs,
-                        myprint_path=args.myprint,
-                        python_exe=args.python,
-                        inventory=inventory,
-                        skip_collector=skip_collector,
-                    )
-                    next_idx = resume.order_index + 1
+                if pages_printed <= 0:
+                    print("\n[print360] No pages were printed in this batch. Stopping to avoid an infinite loop.")
+                    save_links_json(args.out_links_json, links)
+                    return
 
-                print("\n[print360] Continuing in NORMAL MODE from remaining orders...\n")
-            else:
-                print("\n[print360] Did not reach 360 pages. Continuing in NORMAL MODE...\n")
+                ans = input(
+                    "\n[print360] 360-page batch complete. Change paper if needed. "
+                    "Continue with the next 360-page batch? [y/N]: "
+                ).strip().lower()
+                if not ans.startswith("y"):
+                    print("[print360] Stopping now.")
+                    if resume is not None:
+                        print(
+                            f"[print360] Next run should resume order index {resume.order_index}, "
+                            f"manual '{resume.pdf.base}', page {resume.next_page}."
+                        )
+                    save_links_json(args.out_links_json, links)
+                    return
 
-            start_index_for_normal = next_idx
+                batch_no += 1
+
         else:
             start_index_for_normal = 0
             if args.do_print and not default_printer and not args.always_ask_printer:
